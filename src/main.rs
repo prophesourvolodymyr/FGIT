@@ -5,7 +5,7 @@ use crossterm::{
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use fgit::app::App;
+use fgit::{app::App, command::parse_args};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     io::{self, IsTerminal},
@@ -13,12 +13,19 @@ use std::{
 };
 
 fn main() -> Result<()> {
+    let options = match parse_args(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("fgit: {error}");
+            std::process::exit(2);
+        }
+    };
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         eprintln!("fgit: an interactive terminal is required");
         std::process::exit(2);
     }
     let mut session = TerminalSession::new()?;
-    let mut app = App::loading();
+    let mut app = App::loading_with_options(options);
     session.terminal.draw(|frame| app.draw(frame))?;
     app.load_repository(&std::env::current_dir()?);
     loop {

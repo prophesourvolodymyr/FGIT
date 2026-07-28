@@ -40,13 +40,13 @@ Cycles 1, 2, and 3.
 
 ## Cycle 2 - Commit Draft and Destination
 
-- [ ] F01-B - Build message editor and automatic `Auto commit` message
-- [ ] F01-B - Add type, scope, breaking marker, body, and trailer fields
-- [ ] F01-B - Implement local-only, configured-remote, and remote chooser states
-- [ ] F01-B - Implement `fgit c`, `fgit com`, and `fgit commit` aliases
-- [ ] F01-B - Implement `-p`, `-s`, `-r`, combined flags, and `-m`
-- [ ] F01-B - Build exact operation preview and confirmation
-- [ ] F01-B - Verify back, Escape, help, mouse, and arrowless navigation
+- [x] F01-B - Build message editor and automatic `Auto commit` message
+- [x] F01-B - Add type, scope, breaking marker, body, and trailer fields
+- [x] F01-B - Implement local-only, configured-remote, and remote chooser states
+- [x] F01-B - Implement `fgit c`, `fgit com`, and `fgit commit` aliases
+- [x] F01-B - Implement `-p`, `-s`, `-r`, combined flags, and `-m`
+- [x] F01-B - Build exact operation preview and confirmation
+- [x] F01-B - Verify back, Escape, help, mouse, and arrowless navigation
 
 ## Cycle 3 - Commit Progress and Result
 

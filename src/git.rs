@@ -8,7 +8,15 @@ use std::{
 pub struct RepositoryState {
     pub root: PathBuf,
     pub branch: String,
+    pub upstream: Option<Upstream>,
+    pub remotes: Vec<String>,
     pub files: Vec<FileChange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Upstream {
+    pub remote: String,
+    pub branch: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,7 +53,15 @@ impl RepositoryState {
         let root = git_output(start, ["rev-parse", "--show-toplevel"])?;
         let root = PathBuf::from(root.trim());
         let output = git_output_bytes(&root, ["status", "--porcelain=v2", "--branch", "-z"])?;
-        parse_status(&root, &output)
+        let mut state = parse_status(&root, &output)?;
+        state.remotes = git_output(&root, ["remote"])?
+            .lines()
+            .map(str::trim)
+            .filter(|remote| !remote.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        state.upstream = configured_upstream(&root, &state.branch).ok().flatten();
+        Ok(state)
     }
 
     pub fn diff_for(&self, file: &FileChange) -> Result<DiffPreview> {
@@ -107,6 +123,28 @@ impl RepositoryState {
         }
         Ok(truncate_diff(text))
     }
+}
+
+fn configured_upstream(root: &Path, branch: &str) -> Result<Option<Upstream>> {
+    if branch == "detached HEAD" {
+        return Ok(None);
+    }
+    let remote = match git_output(
+        root,
+        ["config", "--get", &format!("branch.{branch}.remote")],
+    ) {
+        Ok(remote) => remote.trim().to_string(),
+        Err(_) => return Ok(None),
+    };
+    let merge = match git_output(root, ["config", "--get", &format!("branch.{branch}.merge")]) {
+        Ok(merge) => merge.trim().to_string(),
+        Err(_) => return Ok(None),
+    };
+    let branch = merge
+        .strip_prefix("refs/heads/")
+        .unwrap_or(&merge)
+        .to_string();
+    Ok((!remote.is_empty() && !branch.is_empty()).then_some(Upstream { remote, branch }))
 }
 
 impl FileChange {
@@ -224,6 +262,8 @@ pub fn parse_status(root: &Path, output: &[u8]) -> Result<RepositoryState> {
     Ok(RepositoryState {
         root: root.to_path_buf(),
         branch,
+        upstream: None,
+        remotes: Vec::new(),
         files,
     })
 }
@@ -315,6 +355,8 @@ mod tests {
             .collect::<Vec<_>>();
         let state = parse_status(Path::new("/repo"), &status).unwrap();
         assert_eq!(state.branch, "main");
+        assert_eq!(state.upstream, None);
+        assert!(state.remotes.is_empty());
         assert_eq!(state.files.len(), 3);
         let modified = state
             .files

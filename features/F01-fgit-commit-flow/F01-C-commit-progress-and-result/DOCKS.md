@@ -54,3 +54,11 @@ Verify successful local commit, successful local-plus-push flow, hook failure,
 push failure after commit, cancellation, Ctrl+C, mouse cleanup, terminal
 cleanup, final hash display, remaining changes, and repeat commit from the
 success screen.
+
+| Test scenario | Result and evidence |
+|---|---|
+| Formatting, unit tests, Git adapter tests, lint, release build | Passed locally on macOS with `cargo fmt && cargo test && cargo clippy -- -D warnings && cargo build --release`. Ten unit tests and three real-Git adapter tests passed. |
+| Blueprint workflow rendering | Ratatui `TestBackend` verifies both small and big responsive layout selection and renders the selection-to-confirmation flow. |
+| Local commit operation | `RepositoryState::commit_selected` stages only the selected paths using direct Git argument arrays, creates a local commit, and reads the short `HEAD` hash. Empty selections and Git failures return an error state. |
+| Optional push operation | Upstream and explicitly selected remote destinations run only after local commit success. Push errors are preserved on the success screen as "local commit succeeded, but push failed." |
+| Target-terminal visual review | Pending: run `target/release/fgit` in the intended terminal and compare visual density, panel proportions, and mouse navigation against the supplied blueprint. |

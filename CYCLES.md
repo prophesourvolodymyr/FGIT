@@ -50,11 +50,11 @@ Cycles 1, 2, and 3.
 
 ## Cycle 3 - Commit Progress and Result
 
-- [ ] F01-C - Run local commit with direct Git arguments
+- [x] F01-C - Run local commit with direct Git arguments
 - [ ] F01-C - Run hooks and display hook output and failure state
-- [ ] F01-C - Display local commit hash and remaining changes
-- [ ] F01-C - Run optional push as a separate operation
-- [ ] F01-C - Display push success separately from local commit success
-- [ ] F01-C - Preserve local success when push fails
-- [ ] F01-C - Verify Ctrl+C, panic cleanup, mouse cleanup, and alternate-screen exit
+- [x] F01-C - Display local commit hash and remaining changes
+- [x] F01-C - Run optional push as a separate operation
+- [x] F01-C - Display push success separately from local commit success
+- [x] F01-C - Preserve local success when push fails
+- [x] F01-C - Verify Ctrl+C, panic cleanup, mouse cleanup, and alternate-screen exit
 - [ ] F01-C - Verify end-to-end behavior on the target Mac terminal

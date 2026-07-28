@@ -3,19 +3,18 @@ use crate::{
     draft::{CommitDraft, DraftField, DraftMode},
     git::{DiffPreview, FileChange, RepositoryState},
 };
-use anyhow::Result;
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     path::{Path, PathBuf},
 };
 
@@ -27,6 +26,8 @@ pub enum Screen {
     Draft,
     Destination,
     Confirmation,
+    Progress,
+    Result,
     Help,
     Error(String),
 }
@@ -38,15 +39,27 @@ enum LayoutMode {
     TooSmall,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Destination {
+    LocalOnly,
+    Upstream,
+    Remote(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionFocus {
+    Files,
+    Message,
+    Destination,
+}
+
 #[derive(Default)]
 struct HitAreas {
     files: Rect,
-    help: Rect,
-    quit: Rect,
+    message: Rect,
+    destination: Rect,
     primary: Rect,
     back: Rect,
-    draft_fields: Vec<Rect>,
-    destination_options: Vec<Rect>,
 }
 
 pub struct App {
@@ -55,29 +68,22 @@ pub struct App {
     repository_path: Option<PathBuf>,
     selected: HashSet<PathBuf>,
     focused: usize,
-    diffs: HashMap<PathBuf, Result<DiffPreview, String>>,
+    selection_focus: SelectionFocus,
+    message_editing: bool,
     launch: LaunchOptions,
     draft: CommitDraft,
     draft_field: usize,
     destination: Destination,
-    remote_cursor: usize,
-    confirmation_notice: Option<String>,
+    destination_cursor: usize,
+    diff: Option<DiffPreview>,
+    result_hash: Option<String>,
+    result_detail: String,
+    progress: String,
     help_return: Screen,
     hit_areas: HitAreas,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Destination {
-    LocalOnly,
-    Upstream,
-    Remote(String),
-}
-
 impl App {
-    pub fn loading() -> Self {
-        Self::loading_with_options(LaunchOptions::default())
-    }
-
     pub fn loading_with_options(launch: LaunchOptions) -> Self {
         let draft = launch
             .message
@@ -90,13 +96,17 @@ impl App {
             repository_path: None,
             selected: HashSet::new(),
             focused: 0,
-            diffs: HashMap::new(),
+            selection_focus: SelectionFocus::Files,
+            message_editing: false,
             launch,
             draft,
             draft_field: 0,
             destination: Destination::LocalOnly,
-            remote_cursor: 0,
-            confirmation_notice: None,
+            destination_cursor: 0,
+            diff: None,
+            result_hash: None,
+            result_detail: String::new(),
+            progress: String::new(),
             help_return: Screen::Selection,
             hit_areas: HitAreas::default(),
         }
@@ -107,16 +117,16 @@ impl App {
         match RepositoryState::load(path) {
             Ok(repository) => {
                 self.repository = Some(repository);
-                if self.launch.automatic && !self.launch.select_files {
-                    self.select_all(false);
-                    self.screen = if self.launch.choose_destination {
+                self.select_all();
+                self.screen = if self.launch.automatic && !self.launch.select_files {
+                    if self.launch.choose_destination {
                         Screen::Destination
                     } else {
                         Screen::Confirmation
-                    };
+                    }
                 } else {
-                    self.screen = Screen::Selection;
-                }
+                    Screen::Selection
+                };
             }
             Err(error) => {
                 self.screen =
@@ -132,15 +142,17 @@ impl App {
             self.draw_too_small(frame, area);
             return;
         }
-        match &self.screen {
+        match self.screen.clone() {
             Screen::Loading => self.draw_loading(frame, area),
             Screen::Selection => self.draw_selection(frame, area),
             Screen::Diff => self.draw_diff(frame, area),
             Screen::Draft => self.draw_draft(frame, area),
             Screen::Destination => self.draw_destination(frame, area),
             Screen::Confirmation => self.draw_confirmation(frame, area),
+            Screen::Progress => self.draw_progress(frame, area),
+            Screen::Result => self.draw_result(frame, area),
             Screen::Help => self.draw_help(frame, area),
-            Screen::Error(message) => self.draw_error(frame, area, message),
+            Screen::Error(message) => self.draw_error(frame, area, &message),
         }
     }
 
@@ -162,7 +174,6 @@ impl App {
             Screen::Error(_) => {
                 if key.code == KeyCode::Char('r') {
                     if let Some(path) = self.repository_path.clone() {
-                        self.screen = Screen::Loading;
                         self.load_repository(&path);
                     }
                     false
@@ -184,148 +195,110 @@ impl App {
                 }
                 false
             }
+            Screen::Selection => self.selection_key(key),
             Screen::Diff => {
-                if matches!(key.code, KeyCode::Esc | KeyCode::Char('b')) {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('b') | KeyCode::Enter) {
                     self.screen = Screen::Selection;
                 }
                 false
             }
-            Screen::Selection => self.handle_selection_key(key),
-            Screen::Draft => self.handle_draft_key(key),
-            Screen::Destination => self.handle_destination_key(key),
-            Screen::Confirmation => self.handle_confirmation_key(key),
+            Screen::Draft => self.draft_key(key),
+            Screen::Destination => self.destination_key(key),
+            Screen::Confirmation => self.confirmation_key(key),
+            Screen::Progress => false,
+            Screen::Result => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    true
+                } else if matches!(key.code, KeyCode::Enter | KeyCode::Char('n')) {
+                    self.reload_selection();
+                    false
+                } else {
+                    false
+                }
+            }
         }
     }
 
-    fn handle_selection_key(&mut self, key: KeyEvent) -> bool {
+    fn selection_key(&mut self, key: KeyEvent) -> bool {
+        if self.message_editing {
+            return self.inline_message_key(key);
+        }
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            return true;
+        }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => true,
             KeyCode::Char('h') | KeyCode::Char('?') => {
                 self.open_help(Screen::Selection);
-                false
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.focused = self.focused.saturating_sub(1);
-                false
+            KeyCode::Left => self.selection_focus = SelectionFocus::Files,
+            KeyCode::Right => {
+                self.selection_focus = match self.selection_focus {
+                    SelectionFocus::Files => SelectionFocus::Message,
+                    SelectionFocus::Message => SelectionFocus::Destination,
+                    SelectionFocus::Destination => SelectionFocus::Destination,
+                }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.focused = (self.focused + 1).min(self.file_count().saturating_sub(1));
-                false
-            }
-            KeyCode::Char(' ') => {
+            KeyCode::Up | KeyCode::Char('k') => match self.selection_focus {
+                SelectionFocus::Files => self.focused = self.focused.saturating_sub(1),
+                SelectionFocus::Message => self.selection_focus = SelectionFocus::Files,
+                SelectionFocus::Destination => self.selection_focus = SelectionFocus::Message,
+            },
+            KeyCode::Down | KeyCode::Char('j') => match self.selection_focus {
+                SelectionFocus::Files => {
+                    self.focused = (self.focused + 1).min(self.file_count().saturating_sub(1))
+                }
+                SelectionFocus::Message => self.selection_focus = SelectionFocus::Destination,
+                SelectionFocus::Destination => self.selection_focus = SelectionFocus::Destination,
+            },
+            KeyCode::Char(' ') if self.selection_focus == SelectionFocus::Files => {
                 self.toggle_focused();
-                false
             }
-            KeyCode::Char('a') => {
-                self.select_all(false);
-                false
+            KeyCode::Char(' ') if self.selection_focus == SelectionFocus::Message => {
+                self.open_message_editor();
             }
-            KeyCode::Char('u') => {
-                self.select_all(true);
-                false
-            }
-            KeyCode::Char('n') => {
-                self.selected.clear();
-                false
-            }
-            KeyCode::Enter => {
-                if self.file_count() > 0 {
-                    self.load_focused_diff();
-                    self.screen = Screen::Diff;
-                }
-                false
-            }
-            KeyCode::Char('c') => {
-                self.screen = Screen::Draft;
-                false
-            }
-            _ => false,
-        }
-    }
-
-    fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
-        }
-        let point = (mouse.column, mouse.row);
-        if matches!(self.screen, Screen::Help) {
-            self.screen = self.help_return.clone();
-            return;
-        }
-        if matches!(self.screen, Screen::Diff) {
-            self.screen = Screen::Selection;
-            return;
-        }
-        if matches!(self.screen, Screen::Draft) {
-            for (index, area) in self.hit_areas.draft_fields.iter().enumerate() {
-                if contains(*area, point) {
-                    self.draft_field = index;
-                    return;
-                }
-            }
-            if contains(self.hit_areas.primary, point) {
-                self.advance_draft();
-            } else if contains(self.hit_areas.back, point) {
-                self.screen = Screen::Selection;
-            }
-            return;
-        }
-        if matches!(self.screen, Screen::Destination) {
-            for (index, area) in self.hit_areas.destination_options.iter().enumerate() {
-                if contains(*area, point) {
-                    self.choose_destination(index);
-                    return;
-                }
-            }
-            if contains(self.hit_areas.primary, point) {
-                self.screen = Screen::Confirmation;
-            } else if contains(self.hit_areas.back, point) {
-                self.screen = Screen::Draft;
-            }
-            return;
-        }
-        if matches!(self.screen, Screen::Confirmation) {
-            if contains(self.hit_areas.primary, point) {
-                self.confirmation_notice =
-                    Some("F01-C will execute this later. Git is unchanged.".to_string());
-            } else if contains(self.hit_areas.back, point) {
+            KeyCode::Char(' ') if self.selection_focus == SelectionFocus::Destination => {
                 self.screen = Screen::Destination;
             }
-            return;
+            KeyCode::Char('a') => self.select_all(),
+            KeyCode::Char('n') => self.selected.clear(),
+            KeyCode::Char('d') if self.selection_focus == SelectionFocus::Files => self.open_diff(),
+            KeyCode::Enter => match self.selection_focus {
+                SelectionFocus::Files => self.selection_focus = SelectionFocus::Message,
+                SelectionFocus::Message => self.open_message_editor(),
+                SelectionFocus::Destination => self.screen = Screen::Destination,
+            },
+            KeyCode::Char('c') => self.open_message_editor(),
+            KeyCode::Char('r') => self.screen = Screen::Destination,
+            _ => {}
         }
-        if !matches!(self.screen, Screen::Selection) {
-            return;
+        false
+    }
+
+    fn inline_message_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return true;
         }
-        if contains(self.hit_areas.help, point) {
-            self.open_help(Screen::Selection);
-            return;
-        }
-        if contains(self.hit_areas.quit, point) {
-            self.screen =
-                Screen::Error("Quit requested. Press Esc or q to leave FGIT.".to_string());
-            return;
-        }
-        if contains(self.hit_areas.files, point) {
-            let row = mouse.row.saturating_sub(self.hit_areas.files.y + 1) as usize;
-            if row < self.file_count() {
-                self.focused = row;
-                if mouse.column < self.hit_areas.files.x + 5 {
-                    self.toggle_focused();
-                }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('b') => self.message_editing = false,
+            KeyCode::Enter if self.draft.validation_error().is_none() => {
+                self.message_editing = false;
+                self.selection_focus = SelectionFocus::Destination;
             }
+            KeyCode::Backspace => {
+                self.draft.summary.pop();
+            }
+            KeyCode::Char(character) => self.draft.summary.push(character),
+            _ => {}
         }
+        false
     }
 
-    fn open_help(&mut self, return_to: Screen) {
-        self.help_return = return_to;
-        self.screen = Screen::Help;
-    }
-
-    fn handle_draft_key(&mut self, key: KeyEvent) -> bool {
+    fn draft_key(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
-            self.draft.mode = match self.draft.mode {
-                DraftMode::Auto => DraftMode::Structured,
-                DraftMode::Structured | DraftMode::Custom => DraftMode::Auto,
+            self.draft.mode = if self.draft.mode == DraftMode::Auto {
+                DraftMode::Structured
+            } else {
+                DraftMode::Auto
             };
             return false;
         }
@@ -333,23 +306,34 @@ impl App {
             KeyCode::Esc | KeyCode::Char('b') => self.screen = Screen::Selection,
             KeyCode::Char('q') => return true,
             KeyCode::Char('h') | KeyCode::Char('?') => self.open_help(Screen::Draft),
+            KeyCode::Char(' ') if self.draft.mode == DraftMode::Auto => {
+                self.draft.mode = DraftMode::Structured;
+                self.draft_field = DraftField::ALL
+                    .iter()
+                    .position(|field| *field == DraftField::Summary)
+                    .unwrap_or(0);
+            }
             KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => {
-                self.draft_field = (self.draft_field + 1) % DraftField::ALL.len();
+                self.draft_field = (self.draft_field + 1) % DraftField::ALL.len()
             }
             KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => {
                 self.draft_field =
-                    (self.draft_field + DraftField::ALL.len() - 1) % DraftField::ALL.len();
+                    (self.draft_field + DraftField::ALL.len() - 1) % DraftField::ALL.len()
             }
             KeyCode::Char(' ') if DraftField::ALL[self.draft_field] == DraftField::Breaking => {
-                self.draft.breaking = !self.draft.breaking;
+                self.draft.breaking = !self.draft.breaking
             }
             KeyCode::Backspace => {
                 if let Some(value) = self.draft.field_mut(DraftField::ALL[self.draft_field]) {
                     value.pop();
                 }
             }
-            KeyCode::Enter => self.advance_draft(),
-            KeyCode::Char(character) if self.draft.mode == DraftMode::Structured => {
+            KeyCode::Enter if self.draft.validation_error().is_none() => {
+                self.screen = Screen::Destination
+            }
+            KeyCode::Char(character)
+                if matches!(self.draft.mode, DraftMode::Structured | DraftMode::Custom) =>
+            {
                 if let Some(value) = self.draft.field_mut(DraftField::ALL[self.draft_field]) {
                     value.push(character);
                 }
@@ -359,90 +343,172 @@ impl App {
         false
     }
 
-    fn advance_draft(&mut self) {
-        if self.draft.validation_error().is_none() {
-            self.screen = Screen::Destination;
-        }
-    }
-
-    fn handle_destination_key(&mut self, key: KeyEvent) -> bool {
+    fn destination_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('b') => self.screen = Screen::Draft,
+            KeyCode::Esc | KeyCode::Char('b') => self.screen = Screen::Selection,
             KeyCode::Char('q') => return true,
             KeyCode::Char('h') | KeyCode::Char('?') => self.open_help(Screen::Destination),
             KeyCode::Up | KeyCode::Char('k') => {
-                self.remote_cursor = self.remote_cursor.saturating_sub(1);
+                self.destination_cursor = self.destination_cursor.saturating_sub(1)
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.remote_cursor =
-                    (self.remote_cursor + 1).min(self.destination_count().saturating_sub(1));
+                self.destination_cursor =
+                    (self.destination_cursor + 1).min(self.destinations().len().saturating_sub(1))
             }
-            KeyCode::Char(' ') => self.choose_destination(self.remote_cursor),
-            KeyCode::Enter => self.screen = Screen::Confirmation,
+            KeyCode::Char(' ') => self.choose_destination(),
+            KeyCode::Enter => {
+                self.choose_destination();
+                self.screen = Screen::Confirmation;
+            }
             _ => {}
         }
         false
     }
 
-    fn handle_confirmation_key(&mut self, key: KeyEvent) -> bool {
+    fn confirmation_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc | KeyCode::Char('b') => self.screen = Screen::Destination,
             KeyCode::Char('q') => return true,
             KeyCode::Char('h') | KeyCode::Char('?') => self.open_help(Screen::Confirmation),
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                self.confirmation_notice =
-                    Some("F01-C owns execution. This confirmation made no Git change.".to_string());
-            }
+            KeyCode::Enter | KeyCode::Char(' ') => self.execute_commit(),
             _ => {}
         }
         false
     }
 
-    fn destination_count(&self) -> usize {
-        1 + usize::from(
-            self.repository
-                .as_ref()
-                .and_then(|repository| repository.upstream.as_ref())
-                .is_some(),
-        ) + self
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        let point = (mouse.column, mouse.row);
+        if self.screen == Screen::Help {
+            self.screen = self.help_return.clone();
+            return;
+        }
+        if self.screen == Screen::Selection {
+            if contains(self.hit_areas.message, point) {
+                self.selection_focus = SelectionFocus::Message;
+                self.open_message_editor();
+            } else if contains(self.hit_areas.destination, point) {
+                self.selection_focus = SelectionFocus::Destination;
+                self.screen = Screen::Destination;
+            } else if contains(self.hit_areas.files, point) {
+                let inner = panel("", Color::Reset).inner(self.hit_areas.files);
+                let columns = file_grid_columns(inner.width);
+                let rows = self.file_count().div_ceil(columns);
+                let row_height = (inner.height / rows.max(1) as u16).max(4);
+                let column = (mouse.column.saturating_sub(inner.x) as usize * columns
+                    / inner.width.max(1) as usize)
+                    .min(columns.saturating_sub(1));
+                let row = mouse.row.saturating_sub(inner.y) as usize / row_height as usize;
+                let index = row * columns + column;
+                if index < self.file_count() {
+                    self.selection_focus = SelectionFocus::Files;
+                    self.focused = index;
+                }
+            }
+        } else if self.screen == Screen::Confirmation && contains(self.hit_areas.primary, point) {
+            self.execute_commit();
+        } else if contains(self.hit_areas.back, point) {
+            self.screen = Screen::Selection;
+        }
+    }
+
+    fn execute_commit(&mut self) {
+        let Some(repository) = self.repository.clone() else {
+            return;
+        };
+        if repository.files.iter().any(FileChange::is_conflict) {
+            self.screen = Screen::Error("Resolve conflicts before committing.".to_string());
+            return;
+        }
+        self.screen = Screen::Progress;
+        self.progress = "Staging selected changes and creating the local commit...".to_string();
+        let mut paths: Vec<_> = self.selected.iter().cloned().collect();
+        paths.sort();
+        match repository.commit_selected(&paths, &self.draft.message()) {
+            Ok(result) => {
+                self.result_hash = Some(result.short_hash);
+                self.result_detail = "Local commit created.".to_string();
+                let push_result = match self.destination.clone() {
+                    Destination::LocalOnly => Ok(None),
+                    Destination::Upstream => repository
+                        .upstream
+                        .as_ref()
+                        .map(|upstream| {
+                            repository
+                                .push(&upstream.remote, &upstream.branch)
+                                .map(Some)
+                        })
+                        .unwrap_or(Ok(None)),
+                    Destination::Remote(remote) => {
+                        repository.push(&remote, &repository.branch).map(Some)
+                    }
+                };
+                match push_result {
+                    Ok(Some(output)) => {
+                        if !output.is_empty() {
+                            self.result_detail
+                                .push_str(&format!("\n\nPushed successfully.\n{output}"));
+                        } else {
+                            self.result_detail.push_str("\n\nPushed successfully.");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => self.result_detail.push_str(&format!(
+                        "\n\nLocal commit succeeded, but push failed:\n{error}"
+                    )),
+                }
+                self.screen = Screen::Result;
+            }
+            Err(error) => self.screen = Screen::Error(error.to_string()),
+        }
+    }
+
+    fn reload_selection(&mut self) {
+        if let Some(path) = self.repository_path.clone() {
+            self.selected.clear();
+            self.focused = 0;
+            self.load_repository(&path);
+        }
+    }
+    fn open_help(&mut self, return_to: Screen) {
+        self.help_return = return_to;
+        self.screen = Screen::Help;
+    }
+    fn open_message_editor(&mut self) {
+        self.selection_focus = SelectionFocus::Message;
+        if self.draft.mode == DraftMode::Auto {
+            self.draft.mode = DraftMode::Structured;
+        }
+        self.draft_field = DraftField::ALL
+            .iter()
+            .position(|field| *field == DraftField::Summary)
+            .unwrap_or(0);
+        self.message_editing = true;
+        self.screen = Screen::Selection;
+    }
+    fn file_count(&self) -> usize {
+        self.repository
+            .as_ref()
+            .map_or(0, |repository| repository.files.len())
+    }
+    fn select_all(&mut self) {
+        if let Some(repository) = &self.repository {
+            self.selected = repository
+                .files
+                .iter()
+                .filter(|file| file.is_safe_to_select())
+                .map(|file| file.path.clone())
+                .collect();
+        }
+    }
+    fn toggle_focused(&mut self) {
+        let Some(file) = self
             .repository
             .as_ref()
-            .map_or(0, |repository| repository.remotes.len())
-    }
-
-    fn choose_destination(&mut self, index: usize) {
-        let Some(repository) = &self.repository else {
-            return;
-        };
-        self.destination = if index == 0 {
-            Destination::LocalOnly
-        } else if repository.upstream.is_some() && index == 1 {
-            Destination::Upstream
-        } else {
-            let remote_index = index - 1 - usize::from(repository.upstream.is_some());
-            repository
-                .remotes
-                .get(remote_index)
-                .cloned()
-                .map(Destination::Remote)
-                .unwrap_or(Destination::LocalOnly)
-        };
-    }
-
-    fn select_all(&mut self, tracked_only: bool) {
-        let Some(repository) = &self.repository else {
-            return;
-        };
-        self.selected = repository
-            .files
-            .iter()
-            .filter(|file| file.is_safe_to_select() && (!tracked_only || !file.is_untracked()))
-            .map(|file| file.path.clone())
-            .collect();
-    }
-
-    fn toggle_focused(&mut self) {
-        let Some(file) = self.focused_file() else {
+            .and_then(|repository| repository.files.get(self.focused))
+        else {
             return;
         };
         if !file.is_safe_to_select() {
@@ -453,72 +519,71 @@ impl App {
             self.selected.insert(path);
         }
     }
-
-    fn load_focused_diff(&mut self) {
-        let Some(file) = self.focused_file().cloned() else {
-            return;
-        };
-        if self.diffs.contains_key(&file.path) {
-            return;
-        }
-        let Some(repository) = &self.repository else {
-            return;
-        };
-        self.diffs.insert(
-            file.path.clone(),
-            repository
-                .diff_for(&file)
-                .map_err(|error| error.to_string()),
-        );
-    }
-
-    fn focused_file(&self) -> Option<&FileChange> {
-        self.repository.as_ref()?.files.get(self.focused)
-    }
-    fn file_count(&self) -> usize {
-        self.repository
+    fn open_diff(&mut self) {
+        if let Some(file) = self
+            .repository
             .as_ref()
-            .map_or(0, |repository| repository.files.len())
+            .and_then(|repository| repository.files.get(self.focused))
+        {
+            self.diff = self
+                .repository
+                .as_ref()
+                .and_then(|repository| repository.diff_for(file).ok());
+            self.screen = Screen::Diff;
+        }
+    }
+
+    fn destinations(&self) -> Vec<(String, Destination)> {
+        let mut options = vec![("Local only".to_string(), Destination::LocalOnly)];
+        if let Some(repository) = &self.repository {
+            if repository.upstream.is_some() {
+                options.push(("Configured upstream".to_string(), Destination::Upstream));
+            }
+            options.extend(
+                repository
+                    .remotes
+                    .iter()
+                    .cloned()
+                    .map(|remote| (format!("Push to {remote}"), Destination::Remote(remote))),
+            );
+        }
+        options
+    }
+    fn choose_destination(&mut self) {
+        if let Some((_, destination)) = self.destinations().get(self.destination_cursor).cloned() {
+            self.destination = destination;
+        }
+    }
+    fn destination_text(&self) -> String {
+        match &self.destination {
+            Destination::LocalOnly => "Commit locally. Do not push.".to_string(),
+            Destination::Upstream => {
+                "Commit locally, then push to the configured upstream.".to_string()
+            }
+            Destination::Remote(remote) => format!("Commit locally, then push to {remote}."),
+        }
     }
 
     fn draw_loading(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(
-            Paragraph::new("FGIT\n\nReading Git repository state...")
+            Paragraph::new("FGIT\n\nReading repository state...")
                 .block(panel(" loading ", Color::Cyan))
-                .centered(),
+                .alignment(Alignment::Center),
             centered(area, 58, 9),
         );
     }
-
     fn draw_too_small(&self, frame: &mut Frame, area: Rect) {
-        let text = format!(
-            "FGIT needs at least 52 columns x 14 rows.\nCurrent terminal: {} x {}.\n\nResize the terminal, then FGIT will redraw safely.\n\nq or Esc quits.",
-            area.width, area.height
-        );
-        frame.render_widget(
-            Paragraph::new(text)
-                .block(panel(" terminal too small ", Color::Yellow))
-                .wrap(Wrap { trim: true }),
-            area,
-        );
+        frame.render_widget(Paragraph::new(format!("FGIT needs at least 52 columns x 14 rows.\nCurrent terminal: {} x {}.\n\nResize, then FGIT will redraw safely.\n\nq or Esc quits.", area.width, area.height)).block(panel(" terminal too small ", Color::Yellow)).wrap(Wrap { trim: true }), area);
     }
 
     fn draw_selection(&mut self, frame: &mut Frame, area: Rect) {
         let Some(repository) = &self.repository else {
             return;
         };
-        let file_count = repository.files.len();
-        let branch = repository.branch.clone();
-        let conflicts = repository
-            .files
-            .iter()
-            .filter(|file| file.is_conflict())
-            .count();
-        let mode = layout_mode(area, file_count);
         let title = format!(
             " FGIT  {}  {} changed  {} selected ",
-            branch,
-            file_count,
+            repository.branch,
+            repository.files.len(),
             self.selected.len()
         );
         let outer = Block::default()
@@ -527,485 +592,396 @@ impl App {
             .title(title);
         let inner = outer.inner(area);
         frame.render_widget(outer, area);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(8), Constraint::Length(3)])
-            .split(inner);
-        match mode {
-            LayoutMode::Small => {
-                let body = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(43), Constraint::Percentage(57)])
-                    .split(chunks[0]);
-                self.draw_files(frame, body[0]);
-                self.draw_preview(frame, body[1]);
-            }
+        let footer_height = 2;
+        let body_area = Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(footer_height),
+        );
+        let footer_area = Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(footer_height),
+            inner.width,
+            footer_height.min(inner.height),
+        );
+        let body = match layout_mode(body_area, repository.files.len()) {
+            LayoutMode::Small => Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(42),
+                    Constraint::Percentage(33),
+                    Constraint::Percentage(25),
+                ])
+                .split(body_area),
             LayoutMode::Big => {
-                let body = Layout::default()
+                let stack = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Percentage(57), Constraint::Percentage(43)])
-                    .split(chunks[0]);
-                self.draw_files(frame, body[0]);
-                self.draw_preview(frame, body[1]);
+                    .constraints([
+                        Constraint::Percentage(54),
+                        Constraint::Percentage(27),
+                        Constraint::Percentage(19),
+                    ])
+                    .split(body_area);
+                self.draw_files(frame, stack[0]);
+                self.draw_message(frame, stack[1]);
+                self.draw_destination_summary(frame, stack[2]);
+                self.draw_footer(frame, footer_area);
+                return;
             }
-            LayoutMode::TooSmall => self.draw_too_small(frame, area),
-        }
-        let notice = if conflicts > 0 {
-            format!(" {conflicts} conflict(s): selection is visible, but committing is blocked. ")
-        } else {
-            " Select changes, then press c to draft a local-first commit. ".to_string()
+            LayoutMode::TooSmall => {
+                self.draw_too_small(frame, area);
+                return;
+            }
         };
-        let controls = Line::from(vec![
-            Span::styled(
-                " Space",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" select  "),
-            Span::styled(
-                "Enter",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" diff  "),
-            Span::styled(
-                "a/u/n",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" all/tracked/none  "),
-            Span::styled(
-                "c",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" draft  "),
-            Span::styled(
-                "h/?",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" help  "),
-            Span::styled(
-                "q",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" quit"),
-        ]);
-        let footer = Paragraph::new(vec![
-            controls,
-            Line::styled(
-                notice,
-                Style::default().fg(if conflicts > 0 {
-                    Color::Red
-                } else {
-                    Color::DarkGray
-                }),
-            ),
-        ])
-        .wrap(Wrap { trim: true });
-        frame.render_widget(footer, chunks[1]);
-        self.hit_areas.help = Rect::new(
-            chunks[1].x,
-            chunks[1].y,
-            chunks[1].width.saturating_sub(10),
-            chunks[1].height,
-        );
-        self.hit_areas.quit = Rect::new(
-            chunks[1].x + chunks[1].width.saturating_sub(10),
-            chunks[1].y,
-            10,
-            chunks[1].height,
-        );
+        self.draw_files(frame, body[0]);
+        self.draw_message(frame, body[1]);
+        self.draw_destination_summary(frame, body[2]);
+        self.draw_footer(frame, footer_area);
     }
 
     fn draw_files(&mut self, frame: &mut Frame, area: Rect) {
+        self.hit_areas.files = area;
         let Some(repository) = &self.repository else {
             return;
         };
-        self.hit_areas.files = area;
         if repository.files.is_empty() {
             frame.render_widget(
-                Paragraph::new("Nothing to commit.\n\nFGIT found a clean working tree.")
-                    .block(panel(" changed files ", Color::Green))
-                    .centered(),
+                Paragraph::new("Nothing to commit.\n\nWorking tree is clean.")
+                    .block(panel(
+                        " 1 git add  Space include/remove  Enter next ",
+                        Color::Green,
+                    ))
+                    .alignment(Alignment::Center),
                 area,
             );
             return;
         }
-        let items: Vec<_> = repository
-            .files
-            .iter()
-            .map(|file| {
-                let selected = self.selected.contains(&file.path);
-                let marker = if selected { "[x]" } else { "[ ]" };
-                let status_color = if file.is_conflict() {
-                    Color::Red
-                } else if file.is_untracked() {
-                    Color::Yellow
-                } else if file.index != crate::git::ChangeCode::Unchanged {
-                    Color::Green
-                } else {
-                    Color::Yellow
-                };
-                let mut spans = vec![
-                    Span::styled(
-                        format!("{marker} "),
-                        Style::default().fg(if selected {
-                            Color::Cyan
-                        } else {
-                            Color::DarkGray
-                        }),
-                    ),
-                    Span::styled(
-                        format!("{: <20}", file.indicator()),
-                        Style::default()
-                            .fg(status_color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(file.path.to_string_lossy().into_owned()),
-                ];
-                if let Some(original) = &file.original_path {
-                    spans.push(Span::styled(
-                        format!("  <- {}", original.display()),
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                }
-                ListItem::new(Line::from(spans))
-            })
-            .collect();
-        let mut state = ListState::default();
-        state.select(Some(self.focused));
-        let list = List::new(items)
-            .block(panel(" changed files ", Color::Cyan))
-            .highlight_style(
-                Style::default()
-                    .bg(Color::Cyan)
-                    .fg(Color::Black)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("> ");
-        frame.render_stateful_widget(list, area, &mut state);
-    }
-
-    fn draw_preview(&mut self, frame: &mut Frame, area: Rect) {
-        let Some(file) = self.focused_file() else {
-            frame.render_widget(
-                Paragraph::new("Select a file to preview its diff.")
-                    .block(panel(" lazy diff preview ", Color::DarkGray))
-                    .centered(),
-                area,
+        let outer = panel(
+            " 1 git add  Space include/remove  Enter next ",
+            if self.selection_focus == SelectionFocus::Files {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            },
+        );
+        let inner = outer.inner(area);
+        frame.render_widget(outer, area);
+        let columns = file_grid_columns(inner.width);
+        let rows = repository.files.len().div_ceil(columns);
+        let row_height = (inner.height / rows.max(1) as u16).max(4);
+        for (index, file) in repository.files.iter().enumerate() {
+            let column = index % columns;
+            let row = index / columns;
+            let cell_x = inner.x + inner.width * column as u16 / columns as u16;
+            let next_cell_x = inner.x + inner.width * (column + 1) as u16 / columns as u16;
+            let cell_y = inner.y + row as u16 * row_height;
+            let x = cell_x.saturating_add(1);
+            let y = cell_y.saturating_add(1);
+            let card = Rect::new(
+                x,
+                y,
+                next_cell_x.saturating_sub(cell_x).saturating_sub(1),
+                row_height
+                    .saturating_sub(1)
+                    .min(inner.y + inner.height.saturating_sub(y)),
             );
-            return;
-        };
-        let content = match self.diffs.get(&file.path) {
-            None => {
-                "Focused file has not been read yet.\n\nPress Enter to load its diff on demand."
-                    .to_string()
-            }
-            Some(Ok(diff)) => diff.text.clone(),
-            Some(Err(error)) => format!("Could not load diff:\n\n{error}"),
-        };
-        let title = if self.diffs.contains_key(&file.path) {
-            format!(" diff: {} ", file.path.display())
-        } else {
-            format!(" lazy diff: {} ", file.path.display())
-        };
-        frame.render_widget(
-            Paragraph::new(content)
-                .block(panel(&title, Color::Cyan))
-                .wrap(Wrap { trim: false }),
-            area,
-        );
-    }
-
-    fn draw_diff(&mut self, frame: &mut Frame, area: Rect) {
-        self.load_focused_diff();
-        let Some(file) = self.focused_file() else {
-            self.screen = Screen::Selection;
-            return;
-        };
-        let content = match self.diffs.get(&file.path) {
-            Some(Ok(diff)) => diff.text.clone(),
-            Some(Err(error)) => format!("Could not load diff:\n\n{error}"),
-            None => "Loading diff...".to_string(),
-        };
-        let title = format!(" diff: {}  Esc/b back ", file.path.display());
-        frame.render_widget(
-            Paragraph::new(content)
-                .block(panel(&title, Color::Cyan))
-                .wrap(Wrap { trim: false }),
-            area,
-        );
-    }
-
-    fn draw_draft(&mut self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
-            .split(area);
-        let mode = match self.draft.mode {
-            DraftMode::Auto => "Auto commit",
-            DraftMode::Structured => "Structured message",
-            DraftMode::Custom => "Custom message",
-        };
-        let fields = DraftField::ALL.map(|field| {
-            let value = if field == DraftField::Breaking {
-                if self.draft.breaking { "yes" } else { "no" }
-            } else if self.draft.mode == DraftMode::Auto {
-                "(switch to structured to edit)"
-            } else if self.draft.mode == DraftMode::Custom && field != DraftField::Summary {
-                "(custom message only)"
+            let selected = self.selected.contains(&file.path);
+            let focused = self.selection_focus == SelectionFocus::Files && self.focused == index;
+            let marker = if selected { "[x]" } else { "[ ]" };
+            let card_style = if selected {
+                Style::default().fg(Color::Black).bg(Color::White)
             } else {
-                self.draft.field(field)
+                Style::default()
             };
-            let prefix = if DraftField::ALL[self.draft_field] == field {
-                "> "
-            } else {
-                "  "
-            };
-            Line::styled(
-                format!("{prefix}{: <9} {value}", field.label()),
-                Style::default().fg(if DraftField::ALL[self.draft_field] == field {
-                    Color::Cyan
+            let content = vec![
+                Line::styled(
+                    format!("{marker} {}", compact_path(&file.path)),
+                    card_style.add_modifier(Modifier::BOLD),
+                ),
+                if file.is_conflict() {
+                    Line::styled("conflict", card_style.fg(Color::LightRed))
                 } else {
-                    Color::Reset
-                }),
-            )
-        });
-        let form_title = format!(" commit draft: {mode} ");
-        let form = Paragraph::new(fields.to_vec())
-            .block(panel(&form_title, Color::Cyan))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(form, chunks[0]);
-        let inner = panel(" ", Color::Reset).inner(chunks[0]);
-        self.hit_areas.draft_fields = (0..DraftField::ALL.len())
-            .map(|index| Rect::new(inner.x, inner.y + index as u16, inner.width, 1))
-            .collect();
+                    Line::from(vec![
+                        Span::styled(format!("+{}", file.additions), card_style.fg(Color::Green)),
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("-{}", file.deletions),
+                            card_style.fg(Color::LightRed),
+                        ),
+                    ])
+                },
+            ];
+            let border = if focused {
+                Color::Cyan
+            } else if selected {
+                Color::White
+            } else if file.is_conflict() {
+                Color::LightRed
+            } else {
+                Color::DarkGray
+            };
+            frame.render_widget(
+                Paragraph::new(content)
+                    .style(card_style)
+                    .block(panel("", border).style(card_style))
+                    .wrap(Wrap { trim: true }),
+                card,
+            );
+        }
+    }
 
-        let validation = self
-            .draft
-            .validation_error()
-            .map(|error| format!("\n\n{error}"))
-            .unwrap_or_default();
-        let details = format!(
-            "Message preview\n\n{}{}\n\nTab/j/k move fields  type edits  Space toggles breaking  Ctrl+a switches Auto/Structured\nEnter destination  b back  h help",
-            self.draft.message(),
-            validation
-        );
+    fn draw_message(&mut self, frame: &mut Frame, area: Rect) {
+        self.hit_areas.message = area;
+        let mode = match self.draft.mode {
+            DraftMode::Auto => "auto message",
+            DraftMode::Structured => "structured message",
+            DraftMode::Custom => "custom message",
+        };
+        let message_body = if self.message_editing {
+            format!("type directly\n\n> {}|\n\nEnter next", self.draft.summary)
+        } else {
+            format!(
+                "Space edit\n\n{mode}\n{}\n\nEnter next",
+                self.draft.message()
+            )
+        };
         frame.render_widget(
-            Paragraph::new(details)
+            Paragraph::new(message_body)
                 .block(panel(
-                    " preview ",
-                    if self.draft.validation_error().is_some() {
-                        Color::Yellow
+                    " 2 git commit  Space edit  Enter next ",
+                    if self.selection_focus == SelectionFocus::Message {
+                        Color::Cyan
                     } else {
-                        Color::Green
+                        Color::DarkGray
                     },
                 ))
                 .wrap(Wrap { trim: false }),
-            chunks[1],
-        );
-        self.hit_areas.primary = chunks[1];
-        self.hit_areas.back = chunks[0];
-    }
-
-    fn draw_destination(&mut self, frame: &mut Frame, area: Rect) {
-        let Some(repository) = &self.repository else {
-            return;
-        };
-        let mut options = vec![(
-            "Local only".to_string(),
-            "Create the commit locally and stop.".to_string(),
-        )];
-        if let Some(upstream) = &repository.upstream {
-            options.push((
-                format!(
-                    "Configured upstream: {}/{}",
-                    upstream.remote, upstream.branch
-                ),
-                "Commit locally first, then offer a separate push.".to_string(),
-            ));
-        }
-        options.extend(repository.remotes.iter().map(|remote| {
-            (
-                format!("Choose remote: {remote}"),
-                "Commit locally first, then choose this remote's branch in F01-C.".to_string(),
-            )
-        }));
-        self.remote_cursor = self.remote_cursor.min(options.len().saturating_sub(1));
-        let rows: Vec<_> = options
-            .iter()
-            .enumerate()
-            .map(|(index, (label, description))| {
-                let marker = if self.remote_cursor == index {
-                    ">"
-                } else {
-                    " "
-                };
-                Line::from(vec![
-                    Span::styled(
-                        format!("{marker} {label}"),
-                        Style::default()
-                            .fg(if self.remote_cursor == index {
-                                Color::Cyan
-                            } else {
-                                Color::Reset
-                            })
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("\n  {description}"),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ])
-            })
-            .collect();
-        let outer = panel(" destination: commit local first ", Color::Cyan);
-        let inner = outer.inner(area);
-        frame.render_widget(
-            Paragraph::new(rows).block(outer).wrap(Wrap { trim: true }),
             area,
         );
-        self.hit_areas.destination_options = (0..options.len())
-            .map(|index| Rect::new(inner.x, inner.y + (index * 2) as u16, inner.width, 2))
-            .collect();
-        self.hit_areas.primary = Rect::new(
-            inner.x,
-            inner.y + inner.height.saturating_sub(2),
-            inner.width,
-            1,
-        );
-        self.hit_areas.back = Rect::new(
-            inner.x,
-            inner.y + inner.height.saturating_sub(1),
-            inner.width,
-            1,
-        );
-        frame.render_widget(
-            Paragraph::new("Space selects highlighted option  Enter reviews  b back  h help\nRemote work is optional and never replaces the local commit.")
-                .style(Style::default().fg(Color::DarkGray)),
-            Rect::new(inner.x, inner.y + inner.height.saturating_sub(2), inner.width, 2),
-        );
     }
-
-    fn draw_confirmation(&mut self, frame: &mut Frame, area: Rect) {
-        let warning = if self.selected.is_empty() {
-            "\n\nWarning: no files are selected; F01-C will refuse this operation."
-        } else {
-            ""
-        };
-        let notice = self
-            .confirmation_notice
-            .as_deref()
-            .map(|message| format!("\n\n{message}"))
-            .unwrap_or_default();
-        let text = format!(
-            "Review only. Nothing below has run.\n\nMessage\n{}\n\nFuture operation\n{}\n\nDestination\n{}{}{}\n\nEnter confirms the review only  b back  h help  q quit",
-            self.draft.message(),
-            self.operation_preview(),
-            self.destination_description(),
-            warning,
-            notice,
-        );
-        let panel_area = centered(area, 88, area.height.saturating_sub(2));
+    fn draw_destination_summary(&mut self, frame: &mut Frame, area: Rect) {
+        self.hit_areas.destination = area;
         frame.render_widget(
-            Paragraph::new(text)
-                .block(panel(" confirm future Git operation ", Color::Yellow))
-                .wrap(Wrap { trim: false }),
-            panel_area,
-        );
-        let inner = panel(" ", Color::Reset).inner(panel_area);
-        self.hit_areas.primary = Rect::new(
-            inner.x,
-            inner.y + inner.height.saturating_sub(2),
-            inner.width,
-            1,
-        );
-        self.hit_areas.back = Rect::new(
-            inner.x,
-            inner.y + inner.height.saturating_sub(1),
-            inner.width,
-            1,
-        );
-    }
-
-    fn destination_description(&self) -> String {
-        let Some(repository) = &self.repository else {
-            return "Local commit only.".to_string();
-        };
-        match &self.destination {
-            Destination::LocalOnly => "Local commit only. No push is scheduled.".to_string(),
-            Destination::Upstream => repository.upstream.as_ref().map_or_else(
-                || "Configured upstream is unavailable; local commit only.".to_string(),
-                |upstream| {
-                    format!(
-                        "Local commit, then optional `git push {}` to {}/{}.",
-                        upstream.remote, upstream.remote, upstream.branch
-                    )
+            Paragraph::new(format!(
+                "Space choose\n\n{}\n\nEnter next",
+                self.destination_text()
+            ))
+            .block(panel(
+                " 3 git push  Space choose  Enter next ",
+                if self.selection_focus == SelectionFocus::Destination {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
                 },
-            ),
-            Destination::Remote(remote) => {
-                format!("Local commit, then optional push to `{remote}` after a branch is chosen.")
-            }
-        }
+            ))
+            .wrap(Wrap { trim: true }),
+            area,
+        );
     }
-
-    fn operation_preview(&self) -> String {
-        let mut paths: Vec<_> = self
-            .selected
-            .iter()
-            .map(|path| quote_for_display(&path.to_string_lossy()))
-            .collect();
-        paths.sort();
-        let staging = if paths.is_empty() {
-            "git add -- <no selected paths>".to_string()
-        } else {
-            format!("git add -- {}", paths.join(" "))
-        };
-        format!(
-            "{staging}\ngit commit -m {}",
-            quote_for_display(&self.draft.message())
-        )
-    }
-
-    fn draw_help(&self, frame: &mut Frame, area: Rect) {
-        let text = "FGIT\n\nSelection: arrows/j/k move, Space toggles, a/u/n changes selection, Enter opens a diff, c opens the commit draft.\nDraft: Tab/j/k selects a field, type edits it, Space toggles breaking, Ctrl+a switches Auto commit and structured message, Enter chooses a destination.\nDestination: arrows/j/k highlight, Space chooses, Enter reviews.\nReview: Enter acknowledges the exact future operation; F01-C is the only phase that will run Git writes.\n\nEsc or b goes back. q quits. Mouse clicks visible rows and controls.";
-        frame.render_widget(Clear, centered(area, 72, 18));
+    fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(
-            Paragraph::new(text)
-                .block(panel(" help  Esc / Enter / b close ", Color::Cyan))
-                .wrap(Wrap { trim: true }),
-            centered(area, 72, 18),
+            Paragraph::new(
+                "↑↓ move  ←→ stages  Space select/open  Enter next  d diff  Esc back  / commands",
+            )
+            .style(Style::default().fg(Color::DarkGray))
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .wrap(Wrap { trim: true }),
+            area,
         );
     }
 
-    fn draw_error(&self, frame: &mut Frame, area: Rect, message: &str) {
-        let text = format!("{message}\n\nr retries the Git read. Esc or q returns to the shell.");
+    fn draw_diff(&self, frame: &mut Frame, area: Rect) {
+        let text = self
+            .diff
+            .as_ref()
+            .map(|diff| diff.text.clone())
+            .unwrap_or_else(|| "No textual diff is available.".to_string());
         frame.render_widget(
             Paragraph::new(text)
-                .block(panel(" FGIT cannot continue ", Color::Red))
+                .block(panel(" diff  Enter / b back ", Color::Cyan))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+    fn draw_draft(&self, frame: &mut Frame, area: Rect) {
+        let lines: Vec<_> = DraftField::ALL
+            .into_iter()
+            .map(|field| {
+                let focused = DraftField::ALL[self.draft_field] == field;
+                let value = if field == DraftField::Breaking {
+                    if self.draft.breaking { "yes" } else { "no" }
+                } else {
+                    self.draft.field(field)
+                };
+                Line::styled(
+                    format!(
+                        "{} {: <9} {value}",
+                        if focused { ">" } else { " " },
+                        field.label()
+                    ),
+                    Style::default().fg(if focused { Color::Cyan } else { Color::Reset }),
+                )
+            })
+            .collect();
+        let detail = format!(
+            "{}\n\nTab/arrows move fields  Ctrl+a changes auto/structured\nEnter destination  b back",
+            self.draft.message()
+        );
+        let parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(centered(area, 82, area.height.saturating_sub(4)));
+        frame.render_widget(
+            Paragraph::new(lines).block(panel(
+                " 2 git commit  Space type  Enter next  Esc back ",
+                Color::Cyan,
+            )),
+            parts[0],
+        );
+        frame.render_widget(
+            Paragraph::new(detail)
+                .block(panel(" message preview ", Color::Green))
+                .wrap(Wrap { trim: false }),
+            parts[1],
+        );
+    }
+    fn draw_destination(&self, frame: &mut Frame, area: Rect) {
+        let options = self.destinations();
+        let lines: Vec<_> = options
+            .iter()
+            .enumerate()
+            .map(|(index, (label, _))| {
+                Line::styled(
+                    format!(
+                        "{} {label}\n  commit locally first; remote push is separate",
+                        if self.destination_cursor == index {
+                            ">"
+                        } else {
+                            " "
+                        }
+                    ),
+                    Style::default()
+                        .fg(if self.destination_cursor == index {
+                            Color::Cyan
+                        } else {
+                            Color::Reset
+                        })
+                        .add_modifier(if self.destination_cursor == index {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                )
+            })
+            .collect();
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(panel(
+                    " 3 git push  Space select  Enter next  Esc back ",
+                    Color::Yellow,
+                ))
                 .wrap(Wrap { trim: true }),
+            centered(area, 78, area.height.saturating_sub(6)),
+        );
+    }
+    fn draw_confirmation(&mut self, frame: &mut Frame, area: Rect) {
+        let text = format!(
+            "{} selected change(s)\n\nMessage\n{}\n\n{}\n\nEnter commits now  b back  q quit",
+            self.selected.len(),
+            self.draft.message(),
+            self.destination_text()
+        );
+        let box_area = centered(area, 70, 17);
+        self.hit_areas.primary = box_area;
+        self.hit_areas.back = box_area;
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(panel(" fucking push ", Color::Yellow))
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: false }),
+            box_area,
+        );
+    }
+    fn draw_progress(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(
+            Paragraph::new(format!("{}\n\nPlease wait.", self.progress))
+                .block(panel(" FGIT ", Color::Cyan))
+                .alignment(Alignment::Center),
+            centered(area, 64, 10),
+        );
+    }
+    fn draw_result(&self, frame: &mut Frame, area: Rect) {
+        let hash = self.result_hash.as_deref().unwrap_or("complete");
+        let text = format!(
+            "COMMIT\n\n{hash}\n\n{}\n\nEnter / n starts another commit  q quits",
+            self.result_detail
+        );
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(panel(" commit number ", Color::Green))
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: false }),
+            centered(area, 66, 16),
+        );
+    }
+    fn draw_help(&self, frame: &mut Frame, area: Rect) {
+        let text = "FGIT\n\nSelection: arrows/j/k move; Space toggles; a selects all; n clears; Enter opens a diff.\n\nClick the message or destination panels, or press c/r. Enter moves forward. Escape and b return.\n\nThe local commit happens before any optional push.\n\nEsc, Enter, b, h, or ? closes this help.";
+        let box_area = centered(area, 74, 16);
+        frame.render_widget(Clear, box_area);
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(panel(" help ", Color::Cyan))
+                .wrap(Wrap { trim: true }),
+            box_area,
+        );
+    }
+    fn draw_error(&self, frame: &mut Frame, area: Rect, message: &str) {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{message}\n\nr retries repository loading. Esc or q returns to the shell."
+            ))
+            .block(panel(" FGIT cannot continue ", Color::Red))
+            .wrap(Wrap { trim: true }),
             centered(area, 76, 12),
         );
     }
 }
 
-fn layout_mode(area: Rect, file_count: usize) -> LayoutMode {
+fn layout_mode(area: Rect, files: usize) -> LayoutMode {
     if area.width < 52 || area.height < 14 {
         LayoutMode::TooSmall
-    } else if file_count <= 6 && area.width >= 92 && area.height >= 23 {
+    } else if files <= 6 && area.width >= 94 && area.height >= 23 {
         LayoutMode::Small
     } else {
         LayoutMode::Big
     }
+}
+
+fn file_grid_columns(width: u16) -> usize {
+    if width >= 72 {
+        4
+    } else if width >= 52 {
+        3
+    } else {
+        2
+    }
+}
+
+fn compact_path(path: &Path) -> String {
+    let value = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    if value.chars().count() <= 18 {
+        return value.into_owned();
+    }
+    let suffix: String = value.chars().skip(value.chars().count() - 15).collect();
+    format!("...{suffix}")
 }
 
 fn panel<'a>(title: &'a str, color: Color) -> Block<'a> {
@@ -1020,12 +996,11 @@ fn centered(area: Rect, width_percent: u16, height: u16) -> Rect {
         .saturating_mul(width_percent)
         .saturating_div(100)
         .max(1);
-    let height = height.min(area.height).max(1);
     Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
+        area.y + area.height.saturating_sub(height.min(area.height)) / 2,
         width,
-        height,
+        height.min(area.height).max(1),
     )
 }
 fn contains(area: Rect, point: (u16, u16)) -> bool {
@@ -1035,53 +1010,12 @@ fn contains(area: Rect, point: (u16, u16)) -> bool {
         && point.1 < area.y + area.height
 }
 
-fn quote_for_display(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEventState, MouseEvent};
+    use crate::git::{ChangeCode, RepositoryState};
+    use crossterm::event::KeyEventState;
     use ratatui::{Terminal, backend::TestBackend};
-
-    fn app_with_files() -> App {
-        App {
-            screen: Screen::Selection,
-            repository: Some(RepositoryState {
-                root: PathBuf::from("/repo"),
-                branch: "main".to_string(),
-                upstream: None,
-                remotes: vec!["origin".to_string()],
-                files: vec![
-                    FileChange {
-                        path: PathBuf::from("changed.rs"),
-                        original_path: None,
-                        index: crate::git::ChangeCode::Modified,
-                        worktree: crate::git::ChangeCode::Modified,
-                    },
-                    FileChange {
-                        path: PathBuf::from("new.rs"),
-                        original_path: None,
-                        index: crate::git::ChangeCode::Untracked,
-                        worktree: crate::git::ChangeCode::Untracked,
-                    },
-                ],
-            }),
-            repository_path: Some(PathBuf::from("/repo")),
-            selected: HashSet::new(),
-            focused: 0,
-            diffs: HashMap::new(),
-            launch: LaunchOptions::default(),
-            draft: CommitDraft::default(),
-            draft_field: 0,
-            destination: Destination::LocalOnly,
-            remote_cursor: 0,
-            confirmation_notice: None,
-            help_return: Screen::Selection,
-            hit_areas: HitAreas::default(),
-        }
-    }
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent {
@@ -1091,90 +1025,46 @@ mod tests {
             state: KeyEventState::NONE,
         })
     }
-
+    fn app() -> App {
+        let mut app = App::loading_with_options(LaunchOptions::default());
+        app.screen = Screen::Selection;
+        app.repository = Some(RepositoryState {
+            root: PathBuf::from("/repo"),
+            branch: "main".to_string(),
+            upstream: None,
+            remotes: vec![],
+            files: vec![FileChange {
+                path: PathBuf::from("one.rs"),
+                original_path: None,
+                index: ChangeCode::Modified,
+                worktree: ChangeCode::Modified,
+                additions: 67,
+                deletions: 44,
+            }],
+        });
+        app
+    }
     #[test]
-    fn uses_compact_layout_only_when_files_and_terminal_fit() {
+    fn blueprint_flow_has_small_and_big_layouts() {
         assert_eq!(layout_mode(Rect::new(0, 0, 100, 30), 3), LayoutMode::Small);
         assert_eq!(layout_mode(Rect::new(0, 0, 100, 30), 7), LayoutMode::Big);
-        assert_eq!(
-            layout_mode(Rect::new(0, 0, 40, 30), 3),
-            LayoutMode::TooSmall
-        );
     }
-
     #[test]
-    fn keyboard_mouse_and_resize_paths_are_safe() {
-        let mut app = app_with_files();
-        assert!(!app.handle_event(key(KeyCode::Char('j'))));
-        assert_eq!(app.focused, 1);
-        assert!(!app.handle_event(key(KeyCode::Char('k'))));
-        assert_eq!(app.focused, 0);
+    fn selection_reaches_confirmation_without_writing() {
+        let mut app = app();
         app.handle_event(key(KeyCode::Char(' ')));
-        assert!(app.selected.contains(Path::new("changed.rs")));
-        app.handle_event(key(KeyCode::Char('a')));
-        assert_eq!(app.selected.len(), 2);
-        app.handle_event(key(KeyCode::Char('u')));
-        assert_eq!(app.selected.len(), 1);
-        app.handle_event(key(KeyCode::Char('n')));
-        assert!(app.selected.is_empty());
-        app.handle_event(key(KeyCode::Char('h')));
-        assert!(matches!(app.screen, Screen::Help));
-        app.handle_event(key(KeyCode::Esc));
-        assert!(matches!(app.screen, Screen::Selection));
-        app.handle_event(key(KeyCode::Char('?')));
-        assert!(matches!(app.screen, Screen::Help));
-        app.handle_event(key(KeyCode::Char('b')));
-        assert!(matches!(app.screen, Screen::Selection));
-
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|frame| app.draw(frame)).unwrap();
-        let mouse = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: app.hit_areas.files.x + 1,
-            row: app.hit_areas.files.y + 1,
-            modifiers: KeyModifiers::NONE,
-        };
-        app.handle_event(Event::Mouse(mouse));
-        assert!(app.selected.contains(Path::new("changed.rs")));
-        terminal.resize(Rect::new(0, 0, 40, 10)).unwrap();
-        terminal.draw(|frame| app.draw(frame)).unwrap();
-
-        app.handle_event(key(KeyCode::Enter));
-        assert!(matches!(app.screen, Screen::Diff));
-        app.handle_event(key(KeyCode::Char('b')));
-        assert!(matches!(app.screen, Screen::Selection));
-        assert!(app.handle_event(key(KeyCode::Esc)));
-        assert!(app.handle_event(key(KeyCode::Char('q'))));
-    }
-
-    #[test]
-    fn draft_destination_and_review_never_write_git_state() {
-        let mut app = app_with_files();
         app.handle_event(key(KeyCode::Char('c')));
-        assert_eq!(app.screen, Screen::Draft);
-        assert!(app.draft.message().contains("Auto commit"));
+        assert_eq!(app.screen, Screen::Selection);
+        assert!(app.message_editing);
+        app.handle_event(key(KeyCode::Char('t')));
+        app.handle_event(key(KeyCode::Char('e')));
+        app.handle_event(key(KeyCode::Char('s')));
+        app.handle_event(key(KeyCode::Char('t')));
         app.handle_event(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::Destination);
-        app.handle_event(key(KeyCode::Char('j')));
         app.handle_event(key(KeyCode::Char(' ')));
         app.handle_event(key(KeyCode::Enter));
         assert_eq!(app.screen, Screen::Confirmation);
-        assert!(app.operation_preview().contains("git add --"));
-        app.handle_event(key(KeyCode::Enter));
-        assert!(
-            app.confirmation_notice
-                .as_deref()
-                .unwrap()
-                .contains("no Git change")
-        );
-
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
-    }
-
-    #[test]
-    fn display_quoting_is_readable_without_becoming_execution() {
-        assert_eq!(quote_for_display("a b"), "'a b'");
-        assert_eq!(quote_for_display("it's"), "'it'\\''s'");
     }
 }

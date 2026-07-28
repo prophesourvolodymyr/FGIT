@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::{
+    fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -25,6 +26,8 @@ pub struct FileChange {
     pub original_path: Option<PathBuf>,
     pub index: ChangeCode,
     pub worktree: ChangeCode,
+    pub additions: usize,
+    pub deletions: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +48,12 @@ pub struct DiffPreview {
     pub truncated: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitResult {
+    pub short_hash: String,
+    pub push_output: Option<String>,
+}
+
 const MAX_DIFF_BYTES: usize = 48 * 1024;
 const MAX_DIFF_LINES: usize = 600;
 
@@ -61,6 +70,13 @@ impl RepositoryState {
             .map(ToString::to_string)
             .collect();
         state.upstream = configured_upstream(&root, &state.branch).ok().flatten();
+        for index in 0..state.files.len() {
+            let file = state.files[index].clone();
+            if let Ok((additions, deletions)) = state.file_stats(&file) {
+                state.files[index].additions = additions;
+                state.files[index].deletions = deletions;
+            }
+        }
         Ok(state)
     }
 
@@ -122,6 +138,91 @@ impl RepositoryState {
             text = "No textual diff is available for this path.".to_string();
         }
         Ok(truncate_diff(text))
+    }
+
+    fn file_stats(&self, file: &FileChange) -> Result<(usize, usize)> {
+        let output = git_output(
+            &self.root,
+            [
+                "diff",
+                "--numstat",
+                "HEAD",
+                "--",
+                file.path.to_string_lossy().as_ref(),
+            ],
+        )?;
+        if let Some(line) = output.lines().next() {
+            let mut fields = line.split_whitespace();
+            let additions = fields
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let deletions = fields
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            return Ok((additions, deletions));
+        }
+        if file.is_untracked() {
+            let additions = fs::read_to_string(self.root.join(&file.path))
+                .map(|text| text.lines().count())
+                .unwrap_or(0);
+            return Ok((additions, 0));
+        }
+        Ok((0, 0))
+    }
+
+    pub fn commit_selected(&self, selected: &[PathBuf], message: &str) -> Result<CommitResult> {
+        if selected.is_empty() {
+            bail!("Select at least one change before committing.");
+        }
+        let paths: Vec<_> = selected.iter().map(|path| path.as_os_str()).collect();
+        let add = Command::new("git")
+            .arg("add")
+            .arg("--")
+            .args(&paths)
+            .current_dir(&self.root)
+            .output()
+            .context("could not stage selected changes")?;
+        if !add.status.success() {
+            bail!(
+                "git add failed: {}",
+                String::from_utf8_lossy(&add.stderr).trim()
+            );
+        }
+        let commit = Command::new("git")
+            .args(["commit", "-m", message])
+            .current_dir(&self.root)
+            .output()
+            .context("could not create commit")?;
+        if !commit.status.success() {
+            bail!(
+                "git commit failed: {}",
+                String::from_utf8_lossy(&commit.stderr).trim()
+            );
+        }
+        let short_hash = git_output(&self.root, ["rev-parse", "--short", "HEAD"])?
+            .trim()
+            .to_string();
+        Ok(CommitResult {
+            short_hash,
+            push_output: None,
+        })
+    }
+
+    pub fn push(&self, remote: &str, branch: &str) -> Result<String> {
+        let output = Command::new("git")
+            .args(["push", remote, &format!("HEAD:{branch}")])
+            .current_dir(&self.root)
+            .output()
+            .context("could not push commit")?;
+        if !output.status.success() {
+            bail!(
+                "git push failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
 }
 
@@ -254,6 +355,8 @@ pub fn parse_status(root: &Path, output: &[u8]) -> Result<RepositoryState> {
                 original_path: None,
                 index: ChangeCode::Untracked,
                 worktree: ChangeCode::Untracked,
+                additions: 0,
+                deletions: 0,
             }),
             _ => {}
         }
@@ -306,6 +409,8 @@ fn status_file(status: &[u8], path: &[u8], original_path: Option<PathBuf>) -> Re
         original_path,
         index: ChangeCode::from_status(status[0]),
         worktree: ChangeCode::from_status(status[1]),
+        additions: 0,
+        deletions: 0,
     })
 }
 

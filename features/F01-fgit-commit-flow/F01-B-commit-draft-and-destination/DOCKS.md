@@ -24,6 +24,14 @@ FGIT creates a commit draft from the selected changes. The user can choose a
 message type, optional scope, optional breaking marker, summary, body, and
 trailers. The user can choose local-only or post-commit push behavior.
 
+The selection screen follows the visual blueprint rather than treating the diff
+as its permanent second panel. In compact mode it shows changed files, commit
+message, and destination as three side-by-side bordered panels. In expanded
+mode it gives files the top majority of the screen and stacks the same commit
+message and destination panels underneath. Enter still opens the focused file's
+full diff view from F01-A. Clicking the message or destination panel opens its
+full editor; `c` and `r` provide the same keyboard actions.
+
 ## Message Rules
 
 The message editor accepts a direct custom message. `-m` and `--message` are
@@ -45,6 +53,13 @@ summary are required there; the custom path requires a non-empty message.
 the selected field, Backspace removes its final character, and Space toggles
 the breaking marker. `Ctrl+a` switches between Auto and Structured modes so
 the ordinary `a` character remains available while writing a message.
+
+From the overview, Space on stage 2 opens the editor and changes the default
+automatic draft into an editable structured draft. Enter submits a valid
+message and moves to destination selection. Space on stage 3 opens the
+destination chooser; Space selects the highlighted destination and Enter moves
+to confirmation. The overview advertises these actions in each panel header
+and in the bottom command bar.
 
 ## Destination Rules
 
@@ -86,7 +101,9 @@ reject during execution.
   optional configured upstream.
 - `src/app.rs` adds draft, destination, and confirmation states while retaining
   F01-A's file selection, diff, responsive layout, mouse capture, help, back,
-  resize, and cleanup behavior.
+  resize, and cleanup behavior. Its selection composition is files/message/
+  destination side-by-side in compact mode and files above message above
+  destination in expanded mode, matching the blueprint's decision hierarchy.
 - `src/main.rs` parses the fast command before opening the alternate screen and
   passes its typed launch options into the application.
 
@@ -104,3 +121,4 @@ help, no accidental push, and review accuracy against Git's actual index state.
 | Keyboard, mouse, help, back, resize | Ratatui `TestBackend` app tests | F01-A navigation remained passing. New test navigated selection, draft, destination, remote selection, review, confirmation acknowledgement, and rendered the result without a Git subprocess write. |
 | Destination and non-writing review on target terminal | macOS `/usr/bin/script` pseudo-terminal at 120x36, repository fixture with `origin`, `backup`, and `branch.main` upstream | Capture at `/var/folders/f2/k3zmhjfx5yd6x965gw58m3m00000gn/T/opencode/fgit-f01b-runtime-session.log` showed Auto commit, local-only, `origin/main`, remote choices, an optional `backup` push, and the confirmation acknowledgement. `git status --short` was `?? "changed file.txt"` both before and after. |
 | Automatic preview path and exact selected-file operation | Same fixture: `fgit c -p` in a macOS pseudo-terminal | Capture at `/var/folders/f2/k3zmhjfx5yd6x965gw58m3m00000gn/T/opencode/fgit-f01b-auto-session.log` showed `git add -- 'changed file.txt'`, `git commit -m 'Auto commit'`, local-only destination, and `F01-C owns execution`. Status was unchanged before and after. Both runtime captures include alternate-screen entry, mouse-capture enablement, all matching mouse-release sequences, and alternate-screen exit. |
+| Blueprint composition correction | Rebuilt release opened in macOS Terminal from the real changed-file fixture | The compact selection state now displays three simultaneous bordered panels: changed files, commit message with the Auto commit preview, and destination with the local-first explanation. Expanded state uses files above message above destination. Full diffs remain available only through Enter, matching the requested visual hierarchy. |

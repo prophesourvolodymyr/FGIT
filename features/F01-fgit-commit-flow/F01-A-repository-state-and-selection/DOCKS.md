@@ -21,8 +21,10 @@ system colors, selected-row emphasis, mouse capture, and terminal lifecycle.
 
 FGIT detects the repository root with Git, reads branch and status data, loads
 changed paths, distinguishes staged and unstaged content, and renders the file
-selection state. It supports keyboard and mouse selection, diff inspection, and
-the same behavior in small and big layouts.
+selection state as a bordered responsive card grid. Each card keeps the compact
+filename, selection marker, status, and effective added/removed line counts
+inside its border. It supports keyboard and mouse selection, diff inspection,
+and the same behavior in small and big layouts.
 
 ## States
 
@@ -42,10 +44,13 @@ the same behavior in small and big layouts.
 
 ## Selection Rules
 
-Space toggles the focused file. `a` selects all safe visible changes. `u`
-selects tracked changes only. `n` clears the commit selection. Enter opens the
-focused diff or activates the focused button according to focus context. Escape
-returns to the previous state. `b` returns to the previous state explicitly.
+All safe visible changes are selected by default. Space toggles the focused file
+in or out of the commit, with selected cards rendered on a white fill. `a`
+selects all safe visible changes and `n` clears the commit selection. Arrow
+keys move within the card grid and between the files, message, and destination
+stages. Enter advances from files to the message stage. `d` opens the focused
+diff. Escape returns to the previous state and `b` remains an explicit back
+shortcut.
 
 Untracked and ignored files must not be staged silently. Ignored files are not
 shown in the normal list unless the user requests them.
@@ -61,7 +66,8 @@ with a visible limit notice so they cannot block the first screen.
 - `Cargo.toml` defines the Rust 2024 binary using Ratatui and Crossterm.
 - `src/git.rs` reads repository root, branch, and porcelain-v2 status with direct
   Git argument arrays. It keeps index and worktree status separate and loads
-  only the focused file's staged, unstaged, or untracked diff on demand.
+  only the focused file's staged, unstaged, or untracked diff on demand. It
+  records per-file added and removed line counts for the selection cards.
 - `src/app.rs` owns the loading, clean, selection, full-diff, help, Git-error,
   and terminal-too-small render states. It chooses a side-by-side small layout
   for up to six files at sufficient dimensions and a stacked big layout
@@ -86,5 +92,6 @@ state, and terminal resize state work on the target Mac terminal.
 | Conflicted repository | `reads_conflicts_without_modifying_the_repository` creates divergent `main` and `topic` edits then merges | Test passed. Conflict status was detected and the conflicted working file remained present. The TUI labels conflicts and disables their selection. |
 | Large focused diff | `lazily_limits_a_large_untracked_diff` fixture with 40,000 lines | Test passed. The diff was requested only for the focused path, then limited to 48 KiB or 600 lines with a visible truncation notice. |
 | Small and big layouts | Ratatui `TestBackend` at 100x30 with 3 and 7 files | Test passed. Three files used the compact split layout; seven used the stacked big layout. |
+| Changed-file card grid | Ratatui `TestBackend` selection render with file statistics | Each changed path renders as a bordered card containing its compact filename, selection marker, status, and `+added -removed` line statistics. |
 | Keyboard, mouse, help, back, quit, resize | Ratatui `TestBackend` interaction test | Test passed for arrows, `j`/`k`, Space, `a`/`u`/`n`, Enter, Escape, `b`, `q`, `h`, `?`, file-checkbox mouse click, and resize to 40x10 without panic. |
 | Full-screen Mac runtime and teardown | macOS `/usr/bin/script` pseudo-terminal: `printf 'q' \| script -q /var/folders/f2/k3zmhjfx5yd6x965gw58m3m00000gn/T/opencode/fgit-big-session.log sh -c "stty cols 120 rows 36 && exec ./target/release/fgit"` | Captured loading state and a 12-file stacked big layout. The capture contains `EnterAlternateScreen`, all enabled mouse modes, `q`, every matching mouse disable sequence, and `LeaveAlternateScreen`; the command returned normally. |

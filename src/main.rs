@@ -30,6 +30,7 @@ fn main() -> Result<()> {
     app.load_repository(&std::env::current_dir()?);
     loop {
         session.terminal.draw(|frame| app.draw(frame))?;
+        app.process_pending();
         if event::poll(Duration::from_millis(150))? && app.handle_event(event::read()?) {
             break;
         }

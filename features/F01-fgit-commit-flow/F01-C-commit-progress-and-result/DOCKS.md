@@ -27,6 +27,13 @@ FGIT runs Git with direct arguments, displays hook output and push progress,
 reports local commit success separately from push success, and returns the
 terminal to the shell cleanly.
 
+The confirmation, progress, and result states occupy the full terminal rather
+than appearing as nested forms. They use short, high-contrast ASCII headings:
+`F U C K I N G PUSH` for the commit confirmation and progress stage, followed by
+`C O M M I T` and the short hash on the result stage. The progress bar animates
+through three visible frames before Git execution begins; the result keeps only
+the compact local/push status words and exit controls visible.
+
 ## Result States
 
 | State | Content |

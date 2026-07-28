@@ -79,6 +79,8 @@ pub struct App {
     result_hash: Option<String>,
     result_detail: String,
     progress: String,
+    commit_pending: bool,
+    progress_ticks: u8,
     help_return: Screen,
     hit_areas: HitAreas,
 }
@@ -107,6 +109,8 @@ impl App {
             result_hash: None,
             result_detail: String::new(),
             progress: String::new(),
+            commit_pending: false,
+            progress_ticks: 0,
             help_return: Screen::Selection,
             hit_areas: HitAreas::default(),
         }
@@ -216,6 +220,17 @@ impl App {
                     false
                 }
             }
+        }
+    }
+
+    pub fn process_pending(&mut self) {
+        if self.commit_pending {
+            if self.progress_ticks < 3 {
+                self.progress_ticks += 1;
+                return;
+            }
+            self.commit_pending = false;
+            self.run_commit();
         }
     }
 
@@ -370,7 +385,7 @@ impl App {
             KeyCode::Esc | KeyCode::Char('b') => self.screen = Screen::Destination,
             KeyCode::Char('q') => return true,
             KeyCode::Char('h') | KeyCode::Char('?') => self.open_help(Screen::Confirmation),
-            KeyCode::Enter | KeyCode::Char(' ') => self.execute_commit(),
+            KeyCode::Enter | KeyCode::Char(' ') => self.begin_commit(),
             _ => {}
         }
         false
@@ -408,13 +423,13 @@ impl App {
                 }
             }
         } else if self.screen == Screen::Confirmation && contains(self.hit_areas.primary, point) {
-            self.execute_commit();
+            self.begin_commit();
         } else if contains(self.hit_areas.back, point) {
             self.screen = Screen::Selection;
         }
     }
 
-    fn execute_commit(&mut self) {
+    fn begin_commit(&mut self) {
         let Some(repository) = self.repository.clone() else {
             return;
         };
@@ -423,13 +438,25 @@ impl App {
             return;
         }
         self.screen = Screen::Progress;
-        self.progress = "Staging selected changes and creating the local commit...".to_string();
+        self.progress = if self.destination == Destination::LocalOnly {
+            "STAGING / COMMITTING".to_string()
+        } else {
+            "STAGING / COMMIT / PUSHING".to_string()
+        };
+        self.progress_ticks = 0;
+        self.commit_pending = true;
+    }
+
+    fn run_commit(&mut self) {
+        let Some(repository) = self.repository.clone() else {
+            return;
+        };
         let mut paths: Vec<_> = self.selected.iter().cloned().collect();
         paths.sort();
         match repository.commit_selected(&paths, &self.draft.message()) {
             Ok(result) => {
                 self.result_hash = Some(result.short_hash);
-                self.result_detail = "Local commit created.".to_string();
+                self.result_detail = "LOCAL COMMIT OK".to_string();
                 let push_result = match self.destination.clone() {
                     Destination::LocalOnly => Ok(None),
                     Destination::Upstream => repository
@@ -446,18 +473,9 @@ impl App {
                     }
                 };
                 match push_result {
-                    Ok(Some(output)) => {
-                        if !output.is_empty() {
-                            self.result_detail
-                                .push_str(&format!("\n\nPushed successfully.\n{output}"));
-                        } else {
-                            self.result_detail.push_str("\n\nPushed successfully.");
-                        }
-                    }
+                    Ok(Some(_)) => self.result_detail.push_str("\nPUSH OK"),
                     Ok(None) => {}
-                    Err(error) => self.result_detail.push_str(&format!(
-                        "\n\nLocal commit succeeded, but push failed:\n{error}"
-                    )),
+                    Err(_) => self.result_detail.push_str("\nPUSH FAILED"),
                 }
                 self.screen = Screen::Result;
             }
@@ -891,42 +909,54 @@ impl App {
     }
     fn draw_confirmation(&mut self, frame: &mut Frame, area: Rect) {
         let text = format!(
-            "{} selected change(s)\n\nMessage\n{}\n\n{}\n\nEnter commits now  b back  q quit",
-            self.selected.len(),
-            self.draft.message(),
-            self.destination_text()
+            "F U C K I N G\n\nP U S H\n\nREADY\n{} FILES\n\nENTER COMMIT   ESC BACK",
+            self.selected.len()
         );
-        let box_area = centered(area, 70, 17);
-        self.hit_areas.primary = box_area;
-        self.hit_areas.back = box_area;
+        let action_area = centered(area, 56, 8);
+        self.hit_areas.primary = action_area;
+        self.hit_areas.back = Rect::new(area.x, area.y, area.width, area.height);
+        frame.render_widget(Clear, area);
         frame.render_widget(
-            Paragraph::new(text)
-                .block(panel(" fucking push ", Color::Yellow))
+            Paragraph::new(full_screen_text(area, text))
                 .alignment(Alignment::Center)
-                .wrap(Wrap { trim: false }),
-            box_area,
+                .style(Style::default().fg(Color::Yellow)),
+            area,
         );
     }
     fn draw_progress(&self, frame: &mut Frame, area: Rect) {
+        let width = area.width.saturating_sub(20).clamp(12, 72) as usize;
+        let filled = width * self.progress_ticks as usize / 3;
+        let bar = format!(
+            "[{}{}]",
+            "=".repeat(filled),
+            ".".repeat(width.saturating_sub(filled))
+        );
+        let text = format!(
+            "F U C K I N G  P U S H\n\n{}\n\n{}\n{} FILES",
+            self.progress,
+            bar,
+            self.selected.len()
+        );
+        frame.render_widget(Clear, area);
         frame.render_widget(
-            Paragraph::new(format!("{}\n\nPlease wait.", self.progress))
-                .block(panel(" FGIT ", Color::Cyan))
-                .alignment(Alignment::Center),
-            centered(area, 64, 10),
+            Paragraph::new(full_screen_text(area, text))
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::Cyan)),
+            area,
         );
     }
     fn draw_result(&self, frame: &mut Frame, area: Rect) {
         let hash = self.result_hash.as_deref().unwrap_or("complete");
         let text = format!(
-            "COMMIT\n\n{hash}\n\n{}\n\nEnter / n starts another commit  q quits",
+            "C O M M I T\n\n{hash}\n\n{}\n\nENTER AGAIN   Q QUIT",
             self.result_detail
         );
+        frame.render_widget(Clear, area);
         frame.render_widget(
-            Paragraph::new(text)
-                .block(panel(" commit number ", Color::Green))
+            Paragraph::new(full_screen_text(area, text))
                 .alignment(Alignment::Center)
-                .wrap(Wrap { trim: false }),
-            centered(area, 66, 16),
+                .style(Style::default().fg(Color::Green)),
+            area,
         );
     }
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
@@ -982,6 +1012,12 @@ fn compact_path(path: &Path) -> String {
     }
     let suffix: String = value.chars().skip(value.chars().count() - 15).collect();
     format!("...{suffix}")
+}
+
+fn full_screen_text(area: Rect, text: String) -> String {
+    let lines = text.lines().count() as u16;
+    let padding = "\n".repeat(area.height.saturating_sub(lines + 1) as usize / 2);
+    format!("{padding}{text}")
 }
 
 fn panel<'a>(title: &'a str, color: Color) -> Block<'a> {

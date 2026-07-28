@@ -176,6 +176,27 @@ impl RepositoryState {
         if selected.is_empty() {
             bail!("Select at least one change before committing.");
         }
+        let excluded: Vec<_> = self
+            .files
+            .iter()
+            .filter(|file| file.index != ChangeCode::Unchanged && !selected.contains(&file.path))
+            .map(|file| file.path.as_os_str())
+            .collect();
+        if !excluded.is_empty() {
+            let reset = Command::new("git")
+                .arg("reset")
+                .arg("--")
+                .args(&excluded)
+                .current_dir(&self.root)
+                .output()
+                .context("could not unstage excluded changes")?;
+            if !reset.status.success() {
+                bail!(
+                    "git reset failed: {}",
+                    String::from_utf8_lossy(&reset.stderr).trim()
+                );
+            }
+        }
         let paths: Vec<_> = selected.iter().map(|path| path.as_os_str()).collect();
         let add = Command::new("git")
             .arg("add")

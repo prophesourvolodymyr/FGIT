@@ -68,7 +68,10 @@ pub struct App {
     repository_path: Option<PathBuf>,
     selected: HashSet<PathBuf>,
     focused: usize,
+    file_columns: usize,
+    file_scroll_row: usize,
     selection_focus: SelectionFocus,
+    files_active: bool,
     message_editing: bool,
     launch: LaunchOptions,
     draft: CommitDraft,
@@ -81,6 +84,7 @@ pub struct App {
     progress: String,
     commit_pending: bool,
     progress_ticks: u8,
+    animation_tick: usize,
     help_return: Screen,
     hit_areas: HitAreas,
 }
@@ -98,7 +102,10 @@ impl App {
             repository_path: None,
             selected: HashSet::new(),
             focused: 0,
+            file_columns: 1,
+            file_scroll_row: 0,
             selection_focus: SelectionFocus::Files,
+            files_active: false,
             message_editing: false,
             launch,
             draft,
@@ -111,6 +118,7 @@ impl App {
             progress: String::new(),
             commit_pending: false,
             progress_ticks: 0,
+            animation_tick: 0,
             help_return: Screen::Selection,
             hit_areas: HitAreas::default(),
         }
@@ -234,9 +242,16 @@ impl App {
         }
     }
 
+    pub fn tick_animation(&mut self) {
+        self.animation_tick = self.animation_tick.wrapping_add(1);
+    }
+
     fn selection_key(&mut self, key: KeyEvent) -> bool {
         if self.message_editing {
             return self.inline_message_key(key);
+        }
+        if self.files_active {
+            return self.active_files_key(key);
         }
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
             return true;
@@ -266,6 +281,7 @@ impl App {
                 SelectionFocus::Destination => self.selection_focus = SelectionFocus::Destination,
             },
             KeyCode::Char(' ') if self.selection_focus == SelectionFocus::Files => {
+                self.files_active = true;
                 self.toggle_focused();
             }
             KeyCode::Char(' ') if self.selection_focus == SelectionFocus::Message => {
@@ -278,12 +294,49 @@ impl App {
             KeyCode::Char('n') => self.selected.clear(),
             KeyCode::Char('d') if self.selection_focus == SelectionFocus::Files => self.open_diff(),
             KeyCode::Enter => match self.selection_focus {
-                SelectionFocus::Files => self.selection_focus = SelectionFocus::Message,
+                SelectionFocus::Files => self.files_active = true,
                 SelectionFocus::Message => self.open_message_editor(),
                 SelectionFocus::Destination => self.screen = Screen::Destination,
             },
             KeyCode::Char('c') => self.open_message_editor(),
             KeyCode::Char('r') => self.screen = Screen::Destination,
+            _ => {}
+        }
+        false
+    }
+
+    fn active_files_key(&mut self, key: KeyEvent) -> bool {
+        if key.code == KeyCode::Char('q') {
+            return true;
+        }
+        match key.code {
+            KeyCode::Esc => self.files_active = false,
+            KeyCode::Enter => {
+                self.files_active = false;
+                self.selection_focus = SelectionFocus::Message;
+            }
+            KeyCode::Char(' ') => self.toggle_focused(),
+            KeyCode::Left if !self.focused.is_multiple_of(self.file_columns) => self.focused -= 1,
+            KeyCode::Right
+                if self.focused + 1 < self.file_count()
+                    && self.focused % self.file_columns < self.file_columns - 1 =>
+            {
+                self.focused += 1;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.focused = self.focused.saturating_sub(self.file_columns);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.focused =
+                    (self.focused + self.file_columns).min(self.file_count().saturating_sub(1));
+            }
+            KeyCode::Char('d') => self.open_diff(),
+            KeyCode::Char('c') => self.open_message_editor(),
+            KeyCode::Char('r') => {
+                self.files_active = false;
+                self.screen = Screen::Destination;
+            }
+            KeyCode::Char('h') | KeyCode::Char('?') => self.open_help(Screen::Selection),
             _ => {}
         }
         false
@@ -410,15 +463,16 @@ impl App {
             } else if contains(self.hit_areas.files, point) {
                 let inner = panel("", Color::Reset).inner(self.hit_areas.files);
                 let columns = file_grid_columns(inner.width);
-                let rows = self.file_count().div_ceil(columns);
-                let row_height = (inner.height / rows.max(1) as u16).max(4);
+                let visible_rows = (inner.height / 4).max(1) as usize;
+                let row_height = (inner.height / visible_rows as u16).max(4);
                 let column = (mouse.column.saturating_sub(inner.x) as usize * columns
                     / inner.width.max(1) as usize)
                     .min(columns.saturating_sub(1));
                 let row = mouse.row.saturating_sub(inner.y) as usize / row_height as usize;
-                let index = row * columns + column;
+                let index = (self.file_scroll_row + row) * columns + column;
                 if index < self.file_count() {
                     self.selection_focus = SelectionFocus::Files;
+                    self.files_active = true;
                     self.focused = index;
                 }
             }
@@ -487,6 +541,7 @@ impl App {
         if let Some(path) = self.repository_path.clone() {
             self.selected.clear();
             self.focused = 0;
+            self.file_scroll_row = 0;
             self.load_repository(&path);
         }
     }
@@ -496,6 +551,7 @@ impl App {
     }
     fn open_message_editor(&mut self) {
         self.selection_focus = SelectionFocus::Message;
+        self.files_active = false;
         if self.draft.mode == DraftMode::Auto {
             self.draft.mode = DraftMode::Structured;
         }
@@ -572,14 +628,48 @@ impl App {
             self.destination = destination;
         }
     }
-    fn destination_text(&self) -> String {
-        match &self.destination {
-            Destination::LocalOnly => "Commit locally. Do not push.".to_string(),
-            Destination::Upstream => {
-                "Commit locally, then push to the configured upstream.".to_string()
-            }
-            Destination::Remote(remote) => format!("Commit locally, then push to {remote}."),
-        }
+    fn destination_choices_text(&self) -> String {
+        self.destinations()
+            .into_iter()
+            .map(|(label, destination)| {
+                let marker = if self.destination == destination {
+                    "*"
+                } else {
+                    " "
+                };
+                format!("{marker} {}", label.to_uppercase())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    fn command_preview(&self) -> String {
+        let mut paths: Vec<_> = self
+            .selected
+            .iter()
+            .map(|path| display_quote(&path.to_string_lossy()))
+            .collect();
+        paths.sort();
+        let add = if paths.is_empty() {
+            "git add -- <none>".to_string()
+        } else {
+            format!("git add -- {}", paths.join(" "))
+        };
+        let commit = format!("git commit -m {}", display_quote(&self.draft.message()));
+        let push = match &self.destination {
+            Destination::LocalOnly => "local only".to_string(),
+            Destination::Upstream => self
+                .repository
+                .as_ref()
+                .and_then(|repository| repository.upstream.as_ref())
+                .map(|upstream| format!("git push {} {}", upstream.remote, upstream.branch))
+                .unwrap_or_else(|| "local only".to_string()),
+            Destination::Remote(remote) => self
+                .repository
+                .as_ref()
+                .map(|repository| format!("git push {} {}", remote, repository.branch))
+                .unwrap_or_else(|| format!("git push {remote}")),
+        };
+        format!("{add}\n{commit}\n{push}")
     }
 
     fn draw_loading(&self, frame: &mut Frame, area: Rect) {
@@ -644,6 +734,8 @@ impl App {
                 self.draw_files(frame, stack[0]);
                 self.draw_message(frame, stack[1]);
                 self.draw_destination_summary(frame, stack[2]);
+                draw_vertical_flow_arrow(frame, stack[0], stack[1]);
+                draw_vertical_flow_arrow(frame, stack[1], stack[2]);
                 self.draw_footer(frame, footer_area);
                 return;
             }
@@ -655,6 +747,8 @@ impl App {
         self.draw_files(frame, body[0]);
         self.draw_message(frame, body[1]);
         self.draw_destination_summary(frame, body[2]);
+        draw_horizontal_flow_arrow(frame, body[0], body[1]);
+        draw_horizontal_flow_arrow(frame, body[1], body[2]);
         self.draw_footer(frame, footer_area);
     }
 
@@ -666,18 +760,17 @@ impl App {
         if repository.files.is_empty() {
             frame.render_widget(
                 Paragraph::new("Nothing to commit.\n\nWorking tree is clean.")
-                    .block(panel(
-                        " 1 git add  Space include/remove  Enter next ",
-                        Color::Green,
-                    ))
+                    .block(panel(" GIT ADD ", Color::Green))
                     .alignment(Alignment::Center),
                 area,
             );
             return;
         }
         let outer = panel(
-            " 1 git add  Space include/remove  Enter next ",
-            if self.selection_focus == SelectionFocus::Files {
+            " GIT ADD ",
+            if self.files_active {
+                Color::White
+            } else if self.selection_focus == SelectionFocus::Files {
                 Color::Cyan
             } else {
                 Color::DarkGray
@@ -685,12 +778,28 @@ impl App {
         );
         let inner = outer.inner(area);
         frame.render_widget(outer, area);
+        if self.selection_focus == SelectionFocus::Files && !self.files_active {
+            draw_border_marker(frame, area, self.animation_tick, Color::Cyan);
+        }
         let columns = file_grid_columns(inner.width);
-        let rows = repository.files.len().div_ceil(columns);
-        let row_height = (inner.height / rows.max(1) as u16).max(4);
-        for (index, file) in repository.files.iter().enumerate() {
+        self.file_columns = columns;
+        let total_rows = repository.files.len().div_ceil(columns);
+        let visible_rows = (inner.height / 4).max(1) as usize;
+        let focus_row = self.focused / columns;
+        let max_scroll = total_rows.saturating_sub(visible_rows);
+        if focus_row < self.file_scroll_row {
+            self.file_scroll_row = focus_row;
+        } else if focus_row >= self.file_scroll_row + visible_rows {
+            self.file_scroll_row = focus_row + 1 - visible_rows;
+        }
+        self.file_scroll_row = self.file_scroll_row.min(max_scroll);
+        let row_height = (inner.height / visible_rows as u16).max(4);
+        let start = self.file_scroll_row * columns;
+        let end = ((self.file_scroll_row + visible_rows) * columns).min(repository.files.len());
+        for index in start..end {
+            let file = &repository.files[index];
             let column = index % columns;
-            let row = index / columns;
+            let row = index / columns - self.file_scroll_row;
             let cell_x = inner.x + inner.width * column as u16 / columns as u16;
             let next_cell_x = inner.x + inner.width * (column + 1) as u16 / columns as u16;
             let cell_y = inner.y + row as u16 * row_height;
@@ -701,7 +810,7 @@ impl App {
                 y,
                 next_cell_x.saturating_sub(cell_x).saturating_sub(1),
                 row_height
-                    .saturating_sub(1)
+                    .saturating_sub(if row_height >= 5 { 1 } else { 0 })
                     .min(inner.y + inner.height.saturating_sub(y)),
             );
             let selected = self.selected.contains(&file.path);
@@ -730,10 +839,10 @@ impl App {
                     ])
                 },
             ];
-            let border = if focused {
-                Color::Cyan
-            } else if selected {
+            let border = if selected {
                 Color::White
+            } else if focused {
+                Color::Cyan
             } else if file.is_conflict() {
                 Color::LightRed
             } else {
@@ -746,56 +855,56 @@ impl App {
                     .wrap(Wrap { trim: true }),
                 card,
             );
+            if focused && !selected {
+                draw_border_marker(frame, card, self.animation_tick, Color::Cyan);
+            }
         }
     }
 
     fn draw_message(&mut self, frame: &mut Frame, area: Rect) {
         self.hit_areas.message = area;
-        let mode = match self.draft.mode {
-            DraftMode::Auto => "auto message",
-            DraftMode::Structured => "structured message",
-            DraftMode::Custom => "custom message",
-        };
         let message_body = if self.message_editing {
-            format!("type directly\n\n> {}|\n\nEnter next", self.draft.summary)
+            format!("> {}|", self.draft.summary)
+        } else if self.draft.mode == DraftMode::Auto {
+            "AUTO COMMIT".to_string()
         } else {
-            format!(
-                "Space edit\n\n{mode}\n{}\n\nEnter next",
-                self.draft.message()
-            )
+            self.draft.message()
+        };
+        let border = if self.message_editing {
+            Color::White
+        } else if self.selection_focus == SelectionFocus::Message {
+            Color::Cyan
+        } else {
+            Color::DarkGray
         };
         frame.render_widget(
             Paragraph::new(message_body)
-                .block(panel(
-                    " 2 git commit  Space edit  Enter next ",
-                    if self.selection_focus == SelectionFocus::Message {
-                        Color::Cyan
-                    } else {
-                        Color::DarkGray
-                    },
-                ))
+                .block(panel(" GIT COMMIT ", border))
                 .wrap(Wrap { trim: false }),
             area,
         );
+        if self.selection_focus == SelectionFocus::Message && !self.message_editing {
+            draw_border_marker(frame, area, self.animation_tick, Color::Cyan);
+        }
     }
     fn draw_destination_summary(&mut self, frame: &mut Frame, area: Rect) {
         self.hit_areas.destination = area;
         frame.render_widget(
-            Paragraph::new(format!(
-                "Space choose\n\n{}\n\nEnter next",
-                self.destination_text()
-            ))
-            .block(panel(
-                " 3 git push  Space choose  Enter next ",
-                if self.selection_focus == SelectionFocus::Destination {
-                    Color::Yellow
-                } else {
-                    Color::DarkGray
-                },
-            ))
-            .wrap(Wrap { trim: true }),
+            Paragraph::new(self.destination_choices_text())
+                .block(panel(
+                    " GIT PUSH ",
+                    if self.selection_focus == SelectionFocus::Destination {
+                        Color::Yellow
+                    } else {
+                        Color::DarkGray
+                    },
+                ))
+                .wrap(Wrap { trim: true }),
             area,
         );
+        if self.selection_focus == SelectionFocus::Destination {
+            draw_border_marker(frame, area, self.animation_tick, Color::Yellow);
+        }
     }
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(
@@ -855,10 +964,7 @@ impl App {
             .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
             .split(centered(area, 82, area.height.saturating_sub(4)));
         frame.render_widget(
-            Paragraph::new(lines).block(panel(
-                " 2 git commit  Space type  Enter next  Esc back ",
-                Color::Cyan,
-            )),
+            Paragraph::new(lines).block(panel(" GIT COMMIT ", Color::Cyan)),
             parts[0],
         );
         frame.render_widget(
@@ -876,12 +982,13 @@ impl App {
             .map(|(index, (label, _))| {
                 Line::styled(
                     format!(
-                        "{} {label}\n  commit locally first; remote push is separate",
+                        "{} {}",
                         if self.destination_cursor == index {
                             ">"
                         } else {
                             " "
-                        }
+                        },
+                        label.to_uppercase()
                     ),
                     Style::default()
                         .fg(if self.destination_cursor == index {
@@ -899,28 +1006,45 @@ impl App {
             .collect();
         frame.render_widget(
             Paragraph::new(lines)
-                .block(panel(
-                    " 3 git push  Space select  Enter next  Esc back ",
-                    Color::Yellow,
-                ))
+                .block(panel(" GIT PUSH ", Color::Yellow))
                 .wrap(Wrap { trim: true }),
             centered(area, 78, area.height.saturating_sub(6)),
         );
     }
     fn draw_confirmation(&mut self, frame: &mut Frame, area: Rect) {
         let text = format!(
-            "F U C K I N G\n\nP U S H\n\nREADY\n{} FILES\n\nENTER COMMIT   ESC BACK",
-            self.selected.len()
+            "F U C K I N G\n\nP U S H\n\nREADY\n{} FILES\n\n{}",
+            self.selected.len(),
+            self.command_preview()
         );
-        let action_area = centered(area, 56, 8);
-        self.hit_areas.primary = action_area;
-        self.hit_areas.back = Rect::new(area.x, area.y, area.width, area.height);
+        let text_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(6));
+        let button_y = area.y + area.height.saturating_sub(5);
+        let button_width = 20;
+        let gap = 4;
+        let total_width = button_width * 2 + gap;
+        let button_x = area.x + area.width.saturating_sub(total_width) / 2;
+        let commit_button = Rect::new(button_x, button_y, button_width, 3);
+        let back_button = Rect::new(button_x + button_width + gap, button_y, button_width, 3);
+        self.hit_areas.primary = commit_button;
+        self.hit_areas.back = back_button;
         frame.render_widget(Clear, area);
         frame.render_widget(
-            Paragraph::new(full_screen_text(area, text))
+            Paragraph::new(full_screen_text(text_area, text))
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(Color::Yellow)),
-            area,
+            text_area,
+        );
+        frame.render_widget(
+            Paragraph::new("ENTER COMMIT")
+                .block(panel("", Color::Yellow))
+                .alignment(Alignment::Center),
+            commit_button,
+        );
+        frame.render_widget(
+            Paragraph::new("ESC BACK")
+                .block(panel("", Color::DarkGray))
+                .alignment(Alignment::Center),
+            back_button,
         );
     }
     fn draw_progress(&self, frame: &mut Frame, area: Rect) {
@@ -1018,6 +1142,68 @@ fn full_screen_text(area: Rect, text: String) -> String {
     let lines = text.lines().count() as u16;
     let padding = "\n".repeat(area.height.saturating_sub(lines + 1) as usize / 2);
     format!("{padding}{text}")
+}
+
+fn display_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn draw_border_marker(frame: &mut Frame, area: Rect, tick: usize, color: Color) {
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+    let mut points = Vec::with_capacity((area.width + area.height) as usize * 2);
+    for x in area.x + 1..area.x + area.width - 1 {
+        points.push((x, area.y));
+    }
+    for y in area.y + 1..area.y + area.height - 1 {
+        points.push((area.x + area.width - 1, y));
+    }
+    for x in (area.x + 1..area.x + area.width - 1).rev() {
+        points.push((x, area.y + area.height - 1));
+    }
+    for y in (area.y + 1..area.y + area.height - 1).rev() {
+        points.push((area.x, y));
+    }
+    let start = tick.wrapping_mul(2) % points.len();
+    for offset in 0..4 {
+        let (x, y) = points[(start + offset) % points.len()];
+        let glyph = if y == area.y || y == area.y + area.height - 1 {
+            "="
+        } else {
+            "|"
+        };
+        frame.render_widget(
+            Paragraph::new(glyph).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Rect::new(x, y, 1, 1),
+        );
+    }
+}
+
+fn draw_horizontal_flow_arrow(frame: &mut Frame, left: Rect, right: Rect) {
+    let x = left.x + left.width.saturating_sub(1);
+    let y = left.y + left.height / 2;
+    frame.render_widget(
+        Paragraph::new("->").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Rect::new(x, y, 2.min(right.x.saturating_sub(x).max(1)), 1),
+    );
+}
+
+fn draw_vertical_flow_arrow(frame: &mut Frame, top: Rect, _bottom: Rect) {
+    let x = top.x + top.width / 2;
+    let y = top.y + top.height.saturating_sub(1);
+    frame.render_widget(
+        Paragraph::new("v").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Rect::new(x, y, 1, 1),
+    );
 }
 
 fn panel<'a>(title: &'a str, color: Color) -> Block<'a> {

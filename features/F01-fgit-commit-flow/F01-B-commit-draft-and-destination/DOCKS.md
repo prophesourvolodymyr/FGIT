@@ -12,10 +12,10 @@ combined selection/destination flags, and custom-message behavior.
 
 Use the WTFIS CLI repository as the direct product-style reference:
 
-`/Users/volodymurvasualkiw/GSpace/Opensource/WTFIS-CLI`
+`/Users/volodymurvasualkiw/GSpace/Opensource/WTF/WTFIS-CLI`
 
-Read `/Users/volodymurvasualkiw/GSpace/Opensource/WTFIS-CLI/README.md` for
-concise command language and `/Users/volodymurvasualkiw/GSpace/Opensource/WTFIS-CLI/src/main.rs`
+Read `/Users/volodymurvasualkiw/GSpace/Opensource/WTF/WTFIS-CLI/README.md` for
+concise command language and `/Users/volodymurvasualkiw/GSpace/Opensource/WTF/WTFIS-CLI/src/main.rs`
 for system-terminal colors, focus states, help presentation, and navigation.
 
 ## What We Build

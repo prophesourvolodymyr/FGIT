@@ -14,9 +14,9 @@ local commit itself is atomic.
 Use the WTFIS CLI repository as the direct terminal lifecycle and cleanup
 reference:
 
-`/Users/volodymurvasualkiw/GSpace/Opensource/WTFIS-CLI`
+`/Users/volodymurvasualkiw/GSpace/Opensource/WTF/WTFIS-CLI`
 
-Read `/Users/volodymurvasualkiw/GSpace/Opensource/WTFIS-CLI/src/main.rs` for
+Read `/Users/volodymurvasualkiw/GSpace/Opensource/WTF/WTFIS-CLI/src/main.rs` for
 mouse capture teardown, system color handling, terminal restoration, and
 return-to-shell behavior. FGIT uses a full-screen alternate screen, but the
 same cleanup quality is required.

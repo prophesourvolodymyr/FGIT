@@ -12,9 +12,9 @@ file-selection command path.
 Use the WTFIS CLI repository as the direct style and terminal-behavior
 reference:
 
-`/Users/volodymurvasualkiw/GSpace/Opensource/WTFIS-CLI`
+`/Users/volodymurvasualkiw/GSpace/Opensource/WTF/WTFIS-CLI`
 
-Read `/Users/volodymurvasualkiw/GSpace/Opensource/WTFIS-CLI/src/main.rs` for
+Read `/Users/volodymurvasualkiw/GSpace/Opensource/WTF/WTFIS-CLI/src/main.rs` for
 system colors, selected-row emphasis, mouse capture, and terminal lifecycle.
 
 ## What We Build

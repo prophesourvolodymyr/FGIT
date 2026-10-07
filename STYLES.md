@@ -4,14 +4,14 @@
 
 FGIT must inherit the established WTFIS CLI visual and terminal style from:
 
-`/Users/volodymurvasualkiw/GSpace/Opensource/WTFIS-CLI`
+`/Users/volodymurvasualkiw/GSpace/Opensource/WTF/WTFIS-CLI`
 
 Before implementing the UI, read the relevant patterns in:
 
-- `/Users/volodymurvasualkiw/GSpace/Opensource/WTFIS-CLI/src/main.rs`
-- `/Users/volodymurvasualkiw/GSpace/Opensource/WTFIS-CLI/README.md`
-- `/Users/volodymurvasualkiw/GSpace/Opensource/WTFIS-CLI/public/`
-- `/Users/volodymurvasualkiw/GSpace/Opensource/WTFIS-CLI/shell/`
+- `/Users/volodymurvasualkiw/GSpace/Opensource/WTF/WTFIS-CLI/src/main.rs`
+- `/Users/volodymurvasualkiw/GSpace/Opensource/WTF/WTFIS-CLI/README.md`
+- `/Users/volodymurvasualkiw/GSpace/Opensource/WTF/WTFIS-CLI/public/`
+- `/Users/volodymurvasualkiw/GSpace/Opensource/WTF/WTFIS-CLI/shell/`
 
 This is a direct product-style reference. FGIT reuses the WTFIS visual
 language, system-terminal colors, concise copy, mouse quality, and cleanup
